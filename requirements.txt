@@ -6,3 +6,4 @@ argon2-cffi>=23,<26
 PyJWT>=2,<3
 pytest>=8,<10
 alembic>=1.13,<2
+Pillow>=10,<12

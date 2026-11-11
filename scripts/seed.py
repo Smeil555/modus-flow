@@ -1,7 +1,7 @@
 import os
 from argon2 import PasswordHasher
 from sqlalchemy import select
-from backend.models import Base, engine, Session, Department, User, Category, RoutingRule
+from backend.models import Base, engine, Session, Department, User, Category, RoutingRule, Role, IntegrationSetting
 from backend.routing import RULES
 
 password=os.getenv('DEMO_PASSWORD','')
@@ -11,6 +11,9 @@ if not inspect(engine).has_table('alembic_version'):
     raise SystemExit('Сначала выполните: python -m alembic upgrade head (для старой базы см. README)')
 names=['IT-отдел','Технический отдел','Отдел закупок','Отдел продаж','Сервисный отдел','HR','Логистика и склад','Руководство']
 with Session.begin() as db:
+    for name in ['EMPLOYEE','SUPER_ADMIN','DEPARTMENT_MANAGER','EXECUTOR']:
+        if not db.scalar(select(Role).where(Role.name==name)): db.add(Role(name=name))
+    if not db.scalar(select(IntegrationSetting).where(IntegrationSetting.name=='configuration_source')): db.add(IntegrationSetting(name='configuration_source',value='environment'))
     for name in names:
         if not db.scalar(select(Department).where(Department.name==name)): db.add(Department(name=name))
     db.flush(); tech=db.scalar(select(Department).where(Department.name=='Технический отдел'))

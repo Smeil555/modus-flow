@@ -21,6 +21,7 @@ with engine.begin() as conn:
     columns={x['name'] for x in inspector.get_columns('tickets')}
     if 'due_at' not in columns: conn.exec_driver_sql('ALTER TABLE tickets ADD COLUMN due_at DATETIME')
     if 'priority' not in columns: conn.exec_driver_sql("ALTER TABLE tickets ADD COLUMN priority VARCHAR NOT NULL DEFAULT 'NORMAL'")
+    if 'implemented' not in columns: conn.exec_driver_sql('ALTER TABLE tickets ADD COLUMN implemented BOOLEAN NOT NULL DEFAULT 0')
     if 'preferred_department_id' not in columns: conn.exec_driver_sql('ALTER TABLE tickets ADD COLUMN preferred_department_id INTEGER REFERENCES departments(id)')
 Base.metadata.create_all(engine)
 command.stamp(Config('alembic.ini'),'head')

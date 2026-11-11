@@ -1,9 +1,10 @@
 from datetime import datetime, timezone
-from sqlalchemy import create_engine, event, String, Integer, Text, ForeignKey, DateTime, Boolean
+from sqlalchemy import create_engine, event, String, Integer, Text, ForeignKey, DateTime, Boolean, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 import os
 
-engine = create_engine(os.getenv('DATABASE_URL', 'sqlite:///./modus.db'), connect_args={'check_same_thread': False})
+database_url = os.getenv('DATABASE_URL', 'sqlite:///./modus.db')
+engine = create_engine(database_url, connect_args={'check_same_thread': False} if database_url.startswith('sqlite') else {})
 @event.listens_for(engine, 'connect')
 def foreign_keys(dbapi, _):
     if engine.dialect.name == 'sqlite': dbapi.execute('PRAGMA foreign_keys=ON')
@@ -41,6 +42,7 @@ class Ticket(Base):
     executor_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'), nullable=True)
     status: Mapped[str] = mapped_column(String, default='NEW')
     result: Mapped[str] = mapped_column(Text, default='')
+    implemented: Mapped[bool] = mapped_column(Boolean,default=False)
     due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 class History(Base):
@@ -99,6 +101,45 @@ class AuthSession(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey('users.id'), index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime)
+    selected_role: Mapped[str | None] = mapped_column(String, nullable=True)
+    selected_department_id: Mapped[int | None] = mapped_column(ForeignKey('departments.id'), nullable=True)
+class RoleGrant(Base):
+    __tablename__='department_members'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.id'),index=True)
+    role: Mapped[str] = mapped_column(String)
+    department_id: Mapped[int | None] = mapped_column(ForeignKey('departments.id'),nullable=True)
+class DeadlineReminder(Base):
+    __tablename__='deadline_reminders'
+    __table_args__=(UniqueConstraint('user_id','ticket_id','due_at','kind',name='uq_deadline_reminder'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    ticket_id: Mapped[int] = mapped_column(ForeignKey('tickets.id'))
+    due_at: Mapped[datetime] = mapped_column(DateTime)
+    kind: Mapped[str] = mapped_column(String)
+class RateLimitBucket(Base):
+    __tablename__='rate_limit_buckets'
+    key: Mapped[str] = mapped_column(String,primary_key=True)
+    period: Mapped[int] = mapped_column(Integer)
+    count: Mapped[int] = mapped_column(Integer)
+class Role(Base):
+    __tablename__='roles'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String,unique=True)
+class TicketAssignment(Base):
+    __tablename__='ticket_assignments'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey('tickets.id'),index=True)
+    department_id: Mapped[int | None] = mapped_column(ForeignKey('departments.id'),nullable=True)
+    executor_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'),nullable=True)
+    actor_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'),nullable=True)
+    event: Mapped[str] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(DateTime,default=now)
+class IntegrationSetting(Base):
+    __tablename__='integration_settings'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String,unique=True)
+    value: Mapped[str] = mapped_column(String)
 class Category(Base):
     __tablename__='categories'
     id: Mapped[int] = mapped_column(primary_key=True)

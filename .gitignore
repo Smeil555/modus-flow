@@ -11,3 +11,5 @@ uploads/
 .pytest_cache/
 presentation-build/
 *.tsbuildinfo
+backup/
+*.bak
