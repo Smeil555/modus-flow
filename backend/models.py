@@ -3,7 +3,7 @@ from sqlalchemy import create_engine, event, String, Integer, Text, ForeignKey, 
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 import os
 
-database_url = os.getenv('DATABASE_URL', 'sqlite:///./modus.db')
+database_url = os.getenv('DATABASE_URL', 'sqlite:///./operations.db')
 engine = create_engine(database_url, connect_args={'check_same_thread': False} if database_url.startswith('sqlite') else {})
 @event.listens_for(engine, 'connect')
 def foreign_keys(dbapi, _):
@@ -19,6 +19,11 @@ class User(Base):
     role: Mapped[str] = mapped_column(String)
     department_id: Mapped[int | None] = mapped_column(ForeignKey('departments.id'))
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, server_default='0')
+class UserPermission(Base):
+    __tablename__ = 'user_permissions'
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.id', ondelete='CASCADE'), primary_key=True)
+    permission: Mapped[str] = mapped_column(String(64), primary_key=True)
 class Department(Base):
     __tablename__='departments'
     id: Mapped[int] = mapped_column(primary_key=True)

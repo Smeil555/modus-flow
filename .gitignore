@@ -13,3 +13,4 @@ presentation-build/
 *.tsbuildinfo
 backup/
 *.bak
+*.db.migrating

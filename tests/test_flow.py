@@ -7,7 +7,7 @@ os.environ['DATABASE_URL']='sqlite:///'+dbpath.as_posix()
 from fastapi.testclient import TestClient
 from argon2 import PasswordHasher
 from backend.models import Base, engine, Session, User, Department, Ticket, History, Comment, Notification
-from backend.main import app, attempts
+from backend.operations_api import app, attempts
 from sqlalchemy import select
 
 Base.metadata.create_all(engine)
@@ -202,14 +202,230 @@ def test_sqlite_backup_does_not_overwrite(tmp_path):
     with pytest.raises(ValueError): backup_database(dbpath,target)
     with sqlite3.connect(target) as copy: assert copy.execute('pragma integrity_check').fetchone()[0]=='ok'
 def test_invalid_external_order_is_recorded_as_failure(monkeypatch):
-    import backend.main as api
+    import backend.operations_api as api
     from backend.models import IntegrationEvent
     attempts.clear(); admin=client('SUPER_ADMIN2')
     with Session.begin() as db:
         t=Ticket(title='Проверка контракта',description='Тестовые данные',category='IT',solution='',recommendation='IT',reason='test',status='NEW');db.add(t);db.flush();tid=t.id
     class BadClient:
         def create_order(self,data,key): return {'id':1}
-    monkeypatch.setattr(api,'integration_client',lambda:BadClient())
+    monkeypatch.setattr(api,'integration_client',lambda mode=None:BadClient())
     assert admin.post(f'/api/tickets/{tid}/orders',json={'item':'Сканер','key':'test-key-12345'}).status_code==502
     with Session() as db:
         event=db.scalar(select(IntegrationEvent).where(IntegrationEvent.ticket_id==tid));assert event is not None and not event.ok
+
+
+def test_account_administration_and_password_lifecycle():
+    attempts.clear()
+    admin = client('SUPER_ADMIN2')
+    department_id = admin.post('/api/departments', json={'name': 'Account test department'}).json()['id']
+    temporary_password = 'temporary-test-password'
+    response = admin.post('/api/users', json={
+        'login': 'new-staff', 'role': 'EMPLOYEE', 'department_id': department_id, 'password': temporary_password,
+    })
+    assert response.status_code == 200, response.text
+    uid = response.json()['id']
+    assert admin.post('/api/users/2', json={'role': 'EMPLOYEE', 'active': False}).status_code == 400
+
+    staff = TestClient(app)
+    response = staff.post('/api/login', json={'login': 'new-staff', 'password': temporary_password})
+    assert response.status_code == 200
+    assert response.json()['department_id'] == department_id
+    staff.headers['X-CSRF-Token'] = response.json()['csrf']
+    assert staff.get('/api/tickets').status_code == 200
+    other_session = TestClient(app)
+    assert other_session.post('/api/login', json={'login': 'new-staff', 'password': temporary_password}).status_code == 200
+    password_change = {
+        'current_password': temporary_password, 'password': 'new-permanent-password',
+        'confirmation': 'new-permanent-password',
+    }
+    assert staff.post('/api/password', json=password_change | {'confirmation': 'incorrect'}).status_code == 400
+    assert staff.post('/api/password', json=password_change | {'current_password': 'incorrect'}).status_code == 400
+    assert staff.post('/api/password', json=password_change).status_code == 200
+    assert other_session.get('/api/me').status_code == 401
+    assert other_session.post('/api/login', json={'login': 'new-staff', 'password': temporary_password}).status_code == 401
+    assert other_session.post('/api/login', json={'login': 'new-staff', 'password': 'new-permanent-password'}).status_code == 200
+    assert staff.get('/api/tickets').status_code == 200
+    assert staff.post(f'/api/users/{uid}', json={'role': 'SUPER_ADMIN'}).status_code == 403
+    assert staff.post(f'/api/users/{uid}/permissions', json={'permissions': ['audit.read']}).status_code == 403
+
+    permissions = f'/api/users/{uid}/permissions'
+    assert staff.get('/api/admin/data').status_code == 403
+    assert admin.post(permissions, json={'permissions': ['data.read']}).status_code == 200
+    assert staff.get('/api/admin/data').json()['engine'] == 'sqlite'
+    assert admin.post(permissions, json={'permissions': []}).status_code == 200
+    assert staff.get('/api/admin/data').status_code == 403
+
+    assert admin.post(f'/api/users/{uid}', json={
+        'login': 'renamed-staff', 'role': 'EXECUTOR', 'department_id': 1, 'active': False,
+    }).status_code == 200
+    assert staff.get('/api/me').status_code == 401
+    assert admin.post(f'/api/users/{uid}/password', json={'password': 'replacement-temporary-password'}).status_code == 200
+    assert admin.post(f'/api/users/{uid}', json={
+        'role': 'EXECUTOR', 'department_id': 1, 'active': True,
+    }).status_code == 200
+    assert staff.post('/api/login', json={'login': 'renamed-staff', 'password': temporary_password}).status_code == 401
+    assert staff.post('/api/login', json={
+        'login': 'renamed-staff', 'password': 'replacement-temporary-password',
+    }).status_code == 200
+
+    audit = admin.get('/api/admin/audit')
+    assert audit.status_code == 200
+    assert all(value not in audit.text for value in (temporary_password, 'replacement-temporary-password'))
+    assert any(entry['actor'] == 'SUPER_ADMIN2' and 'renamed-staff' in entry['action'] for entry in audit.json())
+
+
+def test_initial_seed_and_account_persistence(tmp_path):
+    import secrets
+    import socket
+    import sqlite3
+    import subprocess
+    import sys
+    import time
+    from contextlib import closing, contextmanager
+
+    import httpx
+
+    token = secrets.token_urlsafe(48)
+    initial_password = 'initial-admin-test-password'
+    environment = os.environ | {
+        'DATABASE_URL': 'sqlite:///' + (tmp_path / 'operations.db').as_posix(),
+        'INITIAL_ADMIN_PASSWORD': initial_password,
+        'DATA_SERVICE_TOKEN': token,
+        'DEMO_PASSWORD': '',
+    }
+
+    def run(*args):
+        subprocess.run([sys.executable, *args], env=environment, check=True, capture_output=True, text=True)
+
+    def free_port():
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            return sock.getsockname()[1]
+
+    @contextmanager
+    def server(code, port, headers=None):
+        url = f'http://127.0.0.1:{port}'
+        with subprocess.Popen([sys.executable, '-c', code], env=environment) as process:
+            try:
+                with httpx.Client(base_url=url, headers=headers, trust_env=False, timeout=2) as probe:
+                    for _ in range(100):
+                        assert process.poll() is None
+                        try:
+                            if probe.get('/health').status_code == 200:
+                                break
+                        except httpx.TransportError:
+                            pass
+                        time.sleep(.1)
+                    else:
+                        raise AssertionError('service did not become ready')
+                yield url
+            finally:
+                process.terminate()
+                process.wait(timeout=10)
+
+    @contextmanager
+    def application():
+        data_port, gateway_port = free_port(), free_port()
+        while gateway_port == data_port:
+            gateway_port = free_port()
+        data_code = f'import uvicorn; uvicorn.run("backend.data_server:app", port={data_port}, proxy_headers=False)'
+        gateway_code = (
+            'import uvicorn; from backend import main; '
+            f'main.DATA_URL = "http://127.0.0.1:{data_port}"; '
+            f'uvicorn.run(main.app, port={gateway_port}, proxy_headers=False)'
+        )
+        with server(data_code, data_port, {'X-Modus-Service-Token': token}) as data:
+            assert httpx.get(data + '/health', trust_env=False).status_code == 401
+            with server(gateway_code, gateway_port) as gateway:
+                with httpx.Client(base_url=gateway, trust_env=False) as admin:
+                    response = admin.post('/api/login', json={'login': 'Smeil', 'password': initial_password})
+                    assert response.status_code == 200
+                    assert response.json()['role'] == 'SUPER_ADMIN'
+                    admin.headers['X-CSRF-Token'] = response.json()['csrf']
+                    yield admin, gateway
+
+    run('-m', 'alembic', 'upgrade', 'head')
+    run('-m', 'scripts.seed')
+    with closing(sqlite3.connect(tmp_path / 'operations.db')) as db:
+        assert {'ADMIN', 'ADMIN_ASSISTANT'} <= {row[0] for row in db.execute('SELECT name FROM roles')}
+    with application() as (admin, gateway):
+        for path in ('/users', '/analytics', '/admin/audit', '/admin/data', '/admin/settings',
+                     '/routing-rules', '/departments', '/integration/events', '/tickets'):
+            assert admin.get('/api' + path).status_code == 200, path
+        response = admin.post('/api/users', json={
+            'login': 'persistent-staff', 'password': 'staff-initial-password',
+            'role': 'EMPLOYEE', 'department_id': 1,
+        })
+        assert response.status_code == 200
+        uid = response.json()['id']
+        assert admin.post(f'/api/users/{uid}/permissions', json={'permissions': ['data.read']}).status_code == 200
+        with httpx.Client(base_url=gateway, trust_env=False) as staff:
+            login = {'login': 'persistent-staff', 'password': 'staff-initial-password'}
+            response = staff.post('/api/login', json=login)
+            assert response.status_code == 200
+            staff.headers['X-CSRF-Token'] = response.json()['csrf']
+            assert staff.post(f'/api/users/{uid}', json={'role': 'SUPER_ADMIN'}).status_code == 403
+            assert staff.get('/api/admin/data').status_code == 200
+            departments = admin.get('/api/departments').json()[:2]
+            review_tickets = []
+            for department in departments:
+                response = staff.post('/api/tickets', json={
+                    'title': f"Review request for department {department['id']}",
+                    'description': 'Cross-department review regression test',
+                    'category': 'Оборудование',
+                })
+                assert response.status_code == 200
+                ticket_id = response.json()['ticket']['id']
+                assert admin.post(f'/api/tickets/{ticket_id}/route', json={
+                    'department_id': department['id'],
+                }).status_code == 200
+                review_tickets.append((ticket_id, department['id']))
+            assert staff.post('/api/password', json={
+                'current_password': login['password'], 'password': 'staff-new-password',
+                'confirmation': 'staff-new-password',
+            }).status_code == 200
+            assert staff.post('/api/login', json=login).status_code == 401
+
+        for role in ('ADMIN', 'ADMIN_ASSISTANT'):
+            reviewer_login = 'review-' + role.lower()
+            response = admin.post('/api/users', json={
+                'login': reviewer_login, 'password': 'review-test-password',
+                'role': role if role == 'ADMIN' else 'EMPLOYEE',
+                'department_id': departments[0]['id'],
+            })
+            assert response.status_code == 200
+            reviewer_id = response.json()['id']
+            if role == 'ADMIN_ASSISTANT':
+                assert admin.post(f'/api/users/{reviewer_id}', json={
+                    'role': role, 'department_id': departments[0]['id'],
+                }).status_code == 200
+            with httpx.Client(base_url=gateway, trust_env=False) as reviewer:
+                response = reviewer.post('/api/login', json={'login': reviewer_login, 'password': 'review-test-password'})
+                assert response.status_code == 200 and response.json()['role'] == role
+                reviewer.headers['X-CSRF-Token'] = response.json()['csrf']
+                assert {ticket['id'] for ticket in reviewer.get('/api/tickets').json()} >= {tid for tid, _ in review_tickets}
+                for tid, department_id in review_tickets:
+                    detail = reviewer.get(f'/api/tickets/{tid}').json()
+                    assert detail['department_id'] == department_id
+                    assert detail['status'] == 'ASSIGNED' and detail['history'] and detail['description']
+                    assert reviewer.post(f'/api/tickets/{tid}/comments', json={'body': 'Forbidden'}).status_code == 403
+                    assert reviewer.post(f'/api/tickets/{tid}/status', json={'status': 'REJECTED'}).status_code == 403
+                    assert reviewer.post(f'/api/tickets/{tid}/route', json={'department_id': department_id}).status_code == 403
+                assert reviewer.get('/api/users').status_code == 403
+
+    environment['INITIAL_ADMIN_PASSWORD'] = 'different-seed-password'
+    run('-m', 'scripts.seed')
+    with application() as (admin, gateway):
+        assert any(u['id'] == uid and u['department_id'] == 1 and u['role'] == 'EMPLOYEE'
+                   for u in admin.get('/api/users').json())
+        assert {u['role'] for u in admin.get('/api/users').json()} >= {'ADMIN', 'ADMIN_ASSISTANT'}
+        assert admin.get('/api/admin/data').json()['database'] == 'operations.db'
+        entries = admin.get('/api/admin/audit').json()
+        assert any(e['actor'] == 'Smeil' and 'persistent-staff' in e['action'] for e in entries)
+        assert all('staff-new-password' not in e['action'] for e in entries)
+        with httpx.Client(base_url=gateway, trust_env=False) as staff:
+            assert staff.post('/api/login', json={
+                'login': 'persistent-staff', 'password': 'staff-new-password',
+            }).status_code == 200
+            assert staff.get('/api/admin/data').status_code == 200

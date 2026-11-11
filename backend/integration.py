@@ -32,8 +32,8 @@ class Real1CClient:
         with httpx.Client(timeout=5,auth=self.auth) as client:
             r=client.post(self.url+'/orders',json=data,headers={'Idempotency-Key':key}); r.raise_for_status(); return r.json()
 
-def integration_client():
-    mode=os.getenv('INTEGRATION_MODE','MOCK').upper()
+def integration_client(mode=None):
+    mode=mode or os.getenv('INTEGRATION_MODE','MOCK').upper()
     if mode=='MOCK': return Mock1CClient()
     if mode=='REAL': return Real1CClient()
     raise ValueError('Invalid integration mode')
