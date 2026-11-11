@@ -16,5 +16,9 @@ def test_separate_mock_service(tmp_path, monkeypatch):
         client=Mock1CClient(); products=client.get('/products',{'q':'Zebra'}); assert products[0]['stock']==0
         first=client.create_order({'item':'scanner'},'test-idempotency-key'); second=client.create_order({'item':'scanner'},'test-idempotency-key')
         assert first['id']==second['id']; assert client.get('/orders/'+str(first['id']))['status']=='CREATED'
+        assert httpx.post(url+'/orders',json={'item':'different'},headers={'Idempotency-Key':'test-idempotency-key'}).status_code==409
+        assert httpx.patch(url+'/orders/'+str(first['id']),json={'status':'APPROVED'}).status_code==200
+        assert client.get('/orders/'+str(first['id']))['status']=='APPROVED'
+        assert any(x['operation']=='create_order' for x in client.get('/history'))
     finally:
         process.terminate(); process.wait(timeout=5)

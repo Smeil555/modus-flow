@@ -13,4 +13,10 @@ jobs:
           node-version: '22'
       - run: pip install -r requirements.txt
       - run: python -m pytest -q
-      - run: node --check frontend/app.js
+      - run: python -m alembic upgrade head
+      - run: npm ci
+        working-directory: frontend-react
+      - run: npm test
+        working-directory: frontend-react
+      - run: npm run build
+        working-directory: frontend-react
