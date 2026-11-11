@@ -1,0 +1,12 @@
+.vendor/
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+*.db
+*.sqlite*
+.env
+dist/
+uploads/
+.pytest_cache/
+presentation-build/
