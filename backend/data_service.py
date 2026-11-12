@@ -4,7 +4,7 @@ from fastapi import HTTPException
 from sqlalchemy import delete, select, text
 from sqlalchemy.exc import IntegrityError
 
-from .roles import ROLE_CODES
+from .roles import DEPARTMENT_LEADERS, ROLE_CODES
 from .models import AuditLog, AuthSession, Department, RoleGrant, User, UserPermission
 
 PERMISSIONS = {
@@ -90,7 +90,7 @@ def validate_membership(db, role, department_id, previous_department=None):
         department = db.get(Department, department_id)
         if not department or (not department.active and department_id != previous_department):
             raise HTTPException(400, 'Отдел недоступен')
-    elif role in ('DEPARTMENT_MANAGER', 'EXECUTOR'):
+    elif role in (*DEPARTMENT_LEADERS, 'EXECUTOR'):
         raise HTTPException(400, 'Нужен активный отдел')
 
 
@@ -163,7 +163,7 @@ def update_grants(db, u, uid, data):
             validate_membership(db, grant.role, grant.department_id)
             if (grant.role,grant.department_id) in seen or (grant.role==target.role and grant.department_id==target.department_id): raise HTTPException(400,'Повторное назначение')
             seen.add((grant.role,grant.department_id))
-        for old in db.scalars(select(RoleGrant).where(RoleGrant.user_id==uid)): db.delete(old)
+        for old in db.scalars(select(RoleGrant).where(RoleGrant.user_id==uid, RoleGrant.office.is_(False))): db.delete(old)
         for grant in data.grants: db.add(RoleGrant(user_id=uid,**grant.model_dump()))
         revoke_sessions(db, uid)
         audit(db, u, 'Изменены дополнительные роли '+target.login)

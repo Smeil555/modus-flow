@@ -2,7 +2,8 @@
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from .models import DeadlineReminder, Department, Notification, RoleGrant, Ticket, User
+from .models import DeadlineReminder, Notification, Ticket, User
+from .workflow import active_offices
 
 def generate_reminders(db, now=None):
     now=now or datetime.now(timezone.utc).replace(tzinfo=None)
@@ -11,9 +12,9 @@ def generate_reminders(db, now=None):
     users=list(db.scalars(select(User).where(User.active==True)))
     for ticket in tickets:
         kind='OVERDUE' if ticket.due_at<now else 'DUE_SOON'
+        leaders = {grant.user_id for grant in active_offices(db, ticket.department_id).values()}
         for user in users:
-            roles={(user.role,user.department_id)} | {(g.role,g.department_id) for g in db.scalars(select(RoleGrant).where(RoleGrant.user_id==user.id))}
-            allowed=(user.id==ticket.author_id or user.id==ticket.executor_id or any(role=='SUPER_ADMIN' or (role=='DEPARTMENT_MANAGER' and dept==ticket.department_id and dept is not None) for role,dept in roles))
+            allowed = user.id in (ticket.author_id, ticket.executor_id) or user.id in leaders
             if not allowed: continue
             if db.scalar(select(DeadlineReminder.id).where(DeadlineReminder.user_id==user.id,DeadlineReminder.ticket_id==ticket.id,DeadlineReminder.due_at==ticket.due_at,DeadlineReminder.kind==kind)): continue
             try:

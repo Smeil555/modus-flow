@@ -40,9 +40,9 @@ def required_permission(path, method):
         return 'SUPER_ADMIN'
     if method == 'POST' and re.fullmatch(r'departments(?:/\d+)?', path):
         return 'departments.manage'
-    if (path == 'routing-rules' or method == 'POST') and re.fullmatch(r'(?:categories|routing-rules)(?:/\d+)?', path):
+    if re.fullmatch(r'routing-rules(?:/\d+)?', path):
         return 'categories.manage'
-    if method == 'POST' and re.fullmatch(r'tickets/\d+/(?:route|implementation)', path):
+    if method == 'POST' and re.fullmatch(r'tickets/\d+/implementation', path):
         return 'SUPER_ADMIN'
     return {
         'admin/settings': 'SUPER_ADMIN', 'admin/data': 'data.read', 'admin/audit': 'audit.read',

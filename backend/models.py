@@ -36,25 +36,36 @@ class Ticket(Base):
     title: Mapped[str] = mapped_column(String(200))
     description: Mapped[str] = mapped_column(Text)
     category: Mapped[str] = mapped_column(String)
+    category_id: Mapped[int | None] = mapped_column(ForeignKey('categories.id'))
+    route_rule_id: Mapped[int | None] = mapped_column(ForeignKey('routing_rules.id'))
+    kind: Mapped[str] = mapped_column(String, default='REQUEST', server_default='REQUEST')
     solution: Mapped[str] = mapped_column(Text, default='')
     priority: Mapped[str] = mapped_column(String, default='NORMAL')
     preferred_department_id: Mapped[int | None] = mapped_column(ForeignKey('departments.id'), nullable=True)
     author_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'), nullable=True)
+    author_department_id: Mapped[int | None] = mapped_column(ForeignKey('departments.id'))
     token_hash: Mapped[str | None] = mapped_column(String, nullable=True, unique=True)
     recommendation: Mapped[str] = mapped_column(String)
     reason: Mapped[str] = mapped_column(String)
     department_id: Mapped[int | None] = mapped_column(ForeignKey('departments.id'), nullable=True)
+    owner_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
     executor_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'), nullable=True)
     status: Mapped[str] = mapped_column(String, default='NEW')
     result: Mapped[str] = mapped_column(Text, default='')
     implemented: Mapped[bool] = mapped_column(Boolean,default=False)
     due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    record_version: Mapped[int] = mapped_column(Integer, default=1, server_default='1')
 class History(Base):
     __tablename__='ticket_status_history'
     id: Mapped[int] = mapped_column(primary_key=True)
     ticket_id: Mapped[int] = mapped_column(ForeignKey('tickets.id'), index=True)
     event: Mapped[str] = mapped_column(Text)
+    event_type: Mapped[str | None] = mapped_column(String)
+    actor_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    reason: Mapped[str | None] = mapped_column(Text)
+    origin_status: Mapped[str | None] = mapped_column(String)
+    author_visible: Mapped[bool] = mapped_column(Boolean, default=False, server_default='0')
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 class IntegrationEvent(Base):
     __tablename__='integration_events'
@@ -71,12 +82,13 @@ class Comment(Base):
     author_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'), nullable=True)
     author_label: Mapped[str] = mapped_column(String)
     body: Mapped[str] = mapped_column(Text)
+    internal: Mapped[bool] = mapped_column(Boolean, default=False, server_default='0')
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 class Notification(Base):
     __tablename__='notifications'
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey('users.id'), index=True)
-    ticket_id: Mapped[int] = mapped_column(ForeignKey('tickets.id'))
+    ticket_id: Mapped[int | None] = mapped_column(ForeignKey('tickets.id'))
     message: Mapped[str] = mapped_column(String)
     read: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
@@ -101,6 +113,8 @@ class Attachment(Base):
     name: Mapped[str] = mapped_column(String)
     storage_key: Mapped[str] = mapped_column(String, unique=True)
     size: Mapped[int] = mapped_column(Integer)
+    internal: Mapped[bool] = mapped_column(Boolean, default=False, server_default='0')
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=now)
 class AuthSession(Base):
     __tablename__='auth_sessions'
     id: Mapped[str] = mapped_column(String, primary_key=True)
@@ -114,6 +128,9 @@ class RoleGrant(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey('users.id'),index=True)
     role: Mapped[str] = mapped_column(String)
     department_id: Mapped[int | None] = mapped_column(ForeignKey('departments.id'),nullable=True)
+    office: Mapped[bool] = mapped_column(Boolean, default=False, server_default='0')
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime)
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime)
 class DeadlineReminder(Base):
     __tablename__='deadline_reminders'
     __table_args__=(UniqueConstraint('user_id','ticket_id','due_at','kind',name='uq_deadline_reminder'),)
@@ -156,3 +173,68 @@ class RoutingRule(Base):
     keyword: Mapped[str] = mapped_column(String,unique=True)
     department_id: Mapped[int] = mapped_column(ForeignKey('departments.id'))
     active: Mapped[bool] = mapped_column(Boolean,default=True)
+    category_id: Mapped[int | None] = mapped_column(ForeignKey('categories.id'))
+    version: Mapped[int | None] = mapped_column(Integer)
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime)
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class Clarification(Base):
+    __tablename__ = 'ticket_clarifications'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey('tickets.id'), index=True)
+    asked_by_user_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    origin_status: Mapped[str] = mapped_column(String)
+    question: Mapped[str] = mapped_column(Text)
+    answer: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class WorkResult(Base):
+    __tablename__ = 'ticket_results'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey('tickets.id'), index=True)
+    submitted_by_user_id: Mapped[int] = mapped_column(ForeignKey('users.id'))
+    confirmed_by_user_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    description: Mapped[str] = mapped_column(Text)
+    outcome: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class Refusal(Base):
+    __tablename__ = 'ticket_refusals'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey('tickets.id'), index=True)
+    decided_by_user_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    reason: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+class Appeal(Base):
+    __tablename__ = 'ticket_appeals'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    refusal_id: Mapped[int] = mapped_column(ForeignKey('ticket_refusals.id'), index=True)
+    motivation: Mapped[str] = mapped_column(Text)
+    admitted_by_user_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    admission_decision: Mapped[str] = mapped_column(String)
+    admission_reason: Mapped[str | None] = mapped_column(Text)
+    manager_user_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    admin_user_id: Mapped[int | None] = mapped_column(ForeignKey('users.id'))
+    manager_position: Mapped[str | None] = mapped_column(String)
+    admin_position: Mapped[str | None] = mapped_column(String)
+    manager_reason: Mapped[str | None] = mapped_column(Text)
+    admin_reason: Mapped[str | None] = mapped_column(Text)
+    joint_outcome: Mapped[str | None] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class RoutingIssue(Base):
+    __tablename__ = 'routing_issues'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    category: Mapped[str] = mapped_column(String)
+    reason: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)

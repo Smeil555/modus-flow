@@ -15,7 +15,7 @@ describe('session isolation',()=>{
   await screen.findByText('Добро пожаловать');
   fireEvent.change(screen.getByLabelText('Логин'),{target:{value:'employee'}});fireEvent.change(screen.getByLabelText('Пароль'),{target:{value:'test-password'}});fireEvent.click(screen.getByText('Войти'));
   await screen.findByText('Новое обращение');fireEvent.click(screen.getByText('Новое обращение'));
-  fireEvent.change(screen.getByLabelText('Заголовок'),{target:{value:'Сканер'}});fireEvent.change(screen.getByLabelText('Описание'),{target:{value:'Сканер не работает'}});await screen.findByText('Оборудование');fireEvent.click(screen.getByLabelText('Отправить анонимно'));fireEvent.click(screen.getByText('Отправить'));
+  fireEvent.change(screen.getByLabelText('Заголовок'),{target:{value:'Сканер'}});fireEvent.change(screen.getByLabelText('Описание'),{target:{value:'Сканер не работает'}});await screen.findByText('Оборудование');fireEvent.change(screen.getByRole('combobox',{name:'Категория'}),{target:{value:'Оборудование'}});fireEvent.click(screen.getByLabelText('Отправить анонимно'));fireEvent.click(screen.getByText('Отправить'));
   await screen.findByText('one-time-secret-token');fireEvent.click(screen.getByText('Выйти'));
   await screen.findByText('Добро пожаловать');fireEvent.change(screen.getByLabelText('Логин'),{target:{value:'admin'}});fireEvent.change(screen.getByLabelText('Пароль'),{target:{value:'test-password'}});fireEvent.click(screen.getByText('Войти'));
   await waitFor(()=>expect(screen.getByRole('button',{name:'Профиль · admin'})).toBeTruthy());expect(screen.queryByText('one-time-secret-token')).toBeNull();expect(screen.queryByText('Анонимный доступ')).toBeNull();

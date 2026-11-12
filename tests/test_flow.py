@@ -6,43 +6,94 @@ dbpath=Path(tempfile.mkdtemp())/'test.db'
 os.environ['DATABASE_URL']='sqlite:///'+dbpath.as_posix()
 from fastapi.testclient import TestClient
 from argon2 import PasswordHasher
-from backend.models import Base, engine, Session, User, Department, Ticket, History, Comment, Notification
+from backend.models import Base, engine, Session, User, Department, Ticket, History, Comment, Notification, RoleGrant, Category, RoutingRule
 from backend.operations_api import app, attempts
 from sqlalchemy import select
 
 Base.metadata.create_all(engine)
 with Session.begin() as db:
     db.add_all([Department(id=1,name='Технический отдел'),Department(id=2,name='IT-отдел')]); db.flush()
-    for i,role,dep in [(1,'EMPLOYEE',None),(2,'SUPER_ADMIN',None),(3,'DEPARTMENT_MANAGER',1),(4,'EXECUTOR',1),(5,'EXECUTOR',2)]:
+    for i,role,dep in [(1,'EMPLOYEE',None),(2,'SUPER_ADMIN',None),(3,'DEPARTMENT_MANAGER',1),(4,'EXECUTOR',1),(5,'EXECUTOR',2),(6,'ADMIN',None),(7,'ADMIN_ASSISTANT',None),(8,'EMPLOYEE',2),(9,'EMPLOYEE',1),(10,'DEPARTMENT_MANAGER',2),(11,'EMPLOYEE',1)]:
         db.add(User(id=i,login=role+str(i),password_hash=PasswordHasher().hash('test-password-123'),role=role,department_id=dep))
+    db.flush()
+    db.add_all([
+        RoleGrant(user_id=3, department_id=1, role='DEPARTMENT_MANAGER', office=True),
+        RoleGrant(user_id=10, department_id=2, role='DEPARTMENT_MANAGER', office=True),
+    ])
+    for cid, name in enumerate(('Оборудование', 'IT', 'Склад'), start=1):
+        db.add(Category(id=cid, name=name))
+        db.flush()
+        db.add(RoutingRule(keyword=f'@category:{cid}:1', category_id=cid, department_id=1, version=1))
+
+DUE = '2030-01-01T14:00:00+05:00'
+
+
+def act(client, tid, name, **values):
+    return client.post(f'/api/tickets/{tid}/actions', json={'action': name, **values})
+
+
 def client(login):
     c=TestClient(app); r=c.post('/api/login',json={'login':login,'password':'test-password-123'}); assert r.status_code==200; c.headers['X-CSRF-Token']=r.json()['csrf']; return c
 def test_anonymous_routing_and_isolation():
-    employee=client('EMPLOYEE1'); admin=client('SUPER_ADMIN2'); manager=client('DEPARTMENT_MANAGER3'); executor=client('EXECUTOR4'); outsider=client('EXECUTOR5')
-    r=employee.post('/api/tickets',json={'title':'Не работает сканер','description':'Сканер сломался на складе','category':'Оборудование','anonymous':True}); assert r.status_code==200
-    result=r.json(); tid=result['ticket']['id']; token=result['anonymous_token']; assert result['ticket']['recommendation']=='Технический отдел'
+    attempts.clear()
+    employee, company_admin, manager, executor, outsider = map(
+        client, ('EMPLOYEE1', 'ADMIN6', 'DEPARTMENT_MANAGER3', 'EXECUTOR4', 'EXECUTOR5'))
+    result = employee.post('/api/tickets', json={
+        'title': 'Не работает сканер', 'description': 'Сканер сломался на складе',
+        'category': 'Оборудование', 'anonymous': True,
+    })
+    assert result.status_code == 200, result.text
+    ticket, token = result.json()['ticket'], result.json()['anonymous_token']
+    tid = ticket['id']
+    assert ticket['department_id'] == 1 and ticket['status'] == 'NEW'
     with Session() as db:
-        ticket=db.get(Ticket,tid); assert ticket.author_id is None; assert token != ticket.token_hash; assert all('EMPLOYEE1' not in h.event for h in db.scalars(select(History)))
-    assert employee.get(f'/api/tickets/{tid}').status_code==404
-    assert employee.post('/api/anonymous',json={'token':token}).json()['id']==tid
-    assert manager.get(f'/api/tickets/{tid}').status_code==404
-    assert admin.post(f'/api/tickets/{tid}/route',json={'department_id':1}).status_code==200
-    assert manager.post(f'/api/tickets/{tid}/assign',json={'executor_id':4}).status_code==200
-    assert outsider.get(f'/api/tickets/{tid}').status_code==404
-    assert executor.post(f'/api/tickets/{tid}/status',json={'status':'CLOSED'}).status_code==400
-    assert executor.post(f'/api/tickets/{tid}/status',json={'status':'RESOLVED','result':'Заменён'}).status_code==200
-    assert 'author_id' not in admin.get(f'/api/tickets/{tid}').json()
+        persisted = db.get(Ticket, tid)
+        assert persisted.author_id is None and persisted.author_department_id is None
+        assert persisted.owner_id == 3 and persisted.token_hash != token
+        assert all(event.actor_id is None for event in db.scalars(select(History).where(History.ticket_id == tid)))
+    assert employee.get(f'/api/tickets/{tid}').status_code == 404
+    assert employee.post('/api/anonymous', json={'token': token}).json()['id'] == tid
+    assert company_admin.get(f'/api/tickets/{tid}').json()['access'] == 'oversight'
+    assert 'description' not in company_admin.get(f'/api/tickets/{tid}').json()
+    assert manager.get(f'/api/tickets/{tid}').status_code == 200
+    assert executor.get(f'/api/tickets/{tid}').status_code == 404
+    assert act(manager, tid, 'accept').json()['status'] == 'ASSIGNED'
+    assert act(manager, tid, 'assign', executor_id=4, due_at=DUE).json()['status'] == 'IN_PROGRESS'
+    assert outsider.get(f'/api/tickets/{tid}').status_code == 404
+    assert act(executor, tid, 'close').status_code == 403
+    assert act(executor, tid, 'submit_result', description='Проверен сканер', reason='Заменён').json()['status'] == 'IN_PROGRESS'
+    assert act(executor, tid, 'confirm').status_code == 403
+    assert act(manager, tid, 'confirm').json()['status'] == 'RESOLVED'
+    assert employee.post('/api/anonymous', json={'token': token}).json()['result'] == 'Заменён'
+    assert act(manager, tid, 'close').json()['status'] == 'CLOSED'
+
+
 def test_csrf():
     c=client('EMPLOYEE1'); c.headers['X-CSRF-Token']='bad'; assert c.post('/api/tickets',json={'title':'тест','description':'описание','category':'тест'}).status_code==401
 def test_anonymous_followup_and_notifications():
-    attempts.clear(); employee=client('EMPLOYEE1'); admin=client('SUPER_ADMIN2')
-    created=employee.post('/api/tickets',json={'title':'Проблема склада','description':'Неисправность оборудования','category':'Склад','anonymous':True}).json(); tid=created['ticket']['id']; token=created['anonymous_token']
-    assert admin.post(f'/api/tickets/{tid}/status',json={'status':'NEEDS_INFO','result':'Уточните'}).status_code==200
-    assert employee.post('/api/anonymous/comment',json={'token':token,'body':'Ответ без имени'}).json()['status']=='PENDING_ROUTING'
+    attempts.clear()
+    employee, manager, executor = map(client, ('EMPLOYEE1', 'DEPARTMENT_MANAGER3', 'EXECUTOR4'))
+    result = employee.post('/api/tickets', json={
+        'title': 'Проблема склада', 'description': 'Неисправность оборудования', 'category': 'Склад', 'anonymous': True,
+    }).json()
+    tid, token = result['ticket']['id'], result['anonymous_token']
+    assert act(manager, tid, 'accept').status_code == 200
+    assert act(manager, tid, 'clarify', reason='Укажите модель').json()['status'] == 'NEEDS_INFO'
+    answer = {'token': token, 'action': 'answer', 'reason': 'Ответ без имени'}
+    assert employee.post('/api/anonymous/actions', json=answer).json()['status'] == 'ASSIGNED'
+    assert act(manager, tid, 'assign', executor_id=4, due_at=DUE).status_code == 200
+    assert act(executor, tid, 'clarify', reason='Уточните серийный номер').json()['status'] == 'NEEDS_INFO'
+    assert employee.post('/api/anonymous/actions', json=answer).json()['status'] == 'IN_PROGRESS'
+    assert employee.post('/api/anonymous/comment', json={'token': token, 'body': 'Дополнение'}).status_code == 200
     with Session() as db:
-        comment=db.scalar(select(Comment).where(Comment.ticket_id==tid)); assert comment.author_id is None
-        assert not list(db.scalars(select(Notification).where(Notification.ticket_id==tid,Notification.user_id==1)))
-    assert employee.post('/api/anonymous',json={'token':'x'*40}).status_code==404
+        assert db.scalar(select(Comment).where(Comment.ticket_id == tid)).author_id is None
+        assert not list(db.scalars(select(Notification).where(Notification.ticket_id == tid, Notification.user_id == 1)))
+        answers = list(db.scalars(select(History).where(History.ticket_id == tid, History.event_type == 'ANSWER')))
+        assert [entry.origin_status for entry in answers] == ['NEEDS_INFO', 'NEEDS_INFO']
+        assert all(entry.actor_id is None for entry in answers)
+    assert employee.post('/api/anonymous', json={'token':'x'*40}).status_code == 404
+
+
 def test_attachment_access_and_path_safety(tmp_path,monkeypatch):
     import base64
     attempts.clear(); monkeypatch.setenv('UPLOAD_DIR',str(tmp_path)); employee=client('EMPLOYEE1'); outsider=client('EXECUTOR5')
@@ -66,49 +117,71 @@ def test_logout_revokes_cookie():
     attempts.clear(); c=client('EMPLOYEE1'); token=c.cookies.get('session'); assert c.post('/api/logout').status_code==200
     c.cookies.set('session',token); assert c.get('/api/me').status_code==401
 def test_configured_routing_and_inactive_department():
-    attempts.clear(); admin=client('SUPER_ADMIN2'); employee=client('EMPLOYEE1')
-    assert employee.post('/api/routing-rules',json={'keyword':'принтер','department_id':2}).status_code==403
-    rule=admin.post('/api/routing-rules',json={'keyword':'принтер','department_id':2}); assert rule.status_code==200
-    body={'title':'Принтер сломан','description':'Принтер не печатает документы','category':'IT','preferred_department_id':2,'priority':'HIGH'}
-    first=employee.post('/api/tickets',json=body).json()['ticket']; assert first['recommendation']=='IT-отдел'; assert first['priority']=='HIGH'
-    filtered=employee.get('/api/tickets',params={'priority':'HIGH','category':'IT'}).json()
-    assert any(t['id']==first['id'] for t in filtered) and all(t['priority']=='HIGH' and t['category']=='IT' for t in filtered)
-    assert admin.post('/api/routing-rules/'+str(rule.json()['id']),json={'keyword':'принтер','department_id':2,'active':False}).status_code==200
-    assert employee.post('/api/tickets',json=body).json()['ticket']['recommendation']!='IT-отдел'
-    assert admin.post('/api/departments/2',json={'name':'IT-отдел','description':'','active':False}).status_code==200
-    assert employee.post('/api/tickets',json=body).status_code==400
-    body['preferred_department_id']=None
-    second=employee.post('/api/tickets',json=body).json()['ticket']; assert second['recommendation']!='IT-отдел'
+    attempts.clear()
+    admin, employee, system = map(client, ('ADMIN6', 'EMPLOYEE1', 'SUPER_ADMIN2'))
+    cid = admin.post('/api/categories', json={'name': 'Новая категория'}).json()['id']
+    body = {'title': 'Принтер сломан', 'description': 'Принтер не печатает документы',
+            'category': 'Новая категория', 'preferred_department_id': 1, 'priority': 'HIGH'}
+    route = {'category_id': cid, 'department_id': 2}
+    assert employee.post('/api/workflow/routes', json=route).status_code == 403
+    assert system.post('/api/workflow/routes', json=route).status_code == 403
+    assert employee.post('/api/tickets', json=body).status_code == 409
+    assert any(note['ticket_id'] is None for note in admin.get('/api/notifications').json())
+    assert admin.post('/api/workflow/routes', json=route).json()['version'] == 1
+    first = employee.post('/api/tickets', json=body).json()['ticket']
+    assert first['department_id'] == 2 and first['priority'] == 'HIGH'
+    assert any(t['id'] == first['id'] for t in employee.get('/api/tickets', params={'priority': 'HIGH', 'category': body['category']}).json())
+    assert admin.post('/api/workflow/routes', json=route | {'department_id': 1}).json()['version'] == 2
+    assert employee.post('/api/tickets', json=body).json()['ticket']['department_id'] == 1
+    history = [item for item in admin.get('/api/workflow/routes').json() if item['category_id'] == cid]
+    assert [item['version'] for item in history] == [2, 1]
+    assert history[0]['active'] and not history[1]['active'] and history[1]['valid_to']
+    assert admin.post(f'/api/workflow/routes/{cid}/disable').status_code == 200
+    assert employee.post('/api/tickets', json=body).status_code == 409
+    assert admin.get('/api/workflow/issues').json()['history']
+
+
 def test_multiple_roles_require_admin_grant_and_scoped_switch():
-    attempts.clear(); admin=client('SUPER_ADMIN2'); employee=client('EMPLOYEE1')
-    ticket=employee.post('/api/tickets',json={'title':'Сканер склада','description':'Сканер не работает','category':'Оборудование'}).json()['ticket']['id']
-    assert employee.post('/api/session/role',json={'role':'SUPER_ADMIN','department_id':None}).status_code==403
-    assert admin.post('/api/users/2/grants',json={'grants':[{'role':'EMPLOYEE','department_id':None}]}).status_code==403
-    assert admin.post('/api/users/1/grants',json={'grants':[{'role':'DEPARTMENT_MANAGER','department_id':1}]}).status_code==200
-    assert employee.get('/api/me').status_code==401
-    employee=client('EMPLOYEE1')
-    assert employee.post('/api/session/role',json={'role':'DEPARTMENT_MANAGER','department_id':1}).status_code==200
-    assert employee.post('/api/tickets',json={'title':'Другой','description':'Длинное описание','category':'IT'}).status_code==403
-    assert employee.get(f'/api/tickets/{ticket}').status_code==404
-    assert admin.post(f'/api/tickets/{ticket}/route',json={'department_id':1}).status_code==200
-    assert employee.get(f'/api/tickets/{ticket}').status_code==200
-    assert employee.post('/api/session/role',json={'role':'EMPLOYEE','department_id':None}).status_code==200
-    assert employee.get(f'/api/tickets/{ticket}').status_code==200
+    attempts.clear()
+    admin, employee, manager = map(client, ('SUPER_ADMIN2', 'EMPLOYEE1', 'DEPARTMENT_MANAGER3'))
+    ticket = employee.post('/api/tickets', json={
+        'title': 'Сканер склада', 'description': 'Сканер не работает', 'category': 'Оборудование',
+    }).json()['ticket']['id']
+    assert employee.post('/api/session/role', json={'role': 'SUPER_ADMIN', 'department_id': None}).status_code == 403
+    assert admin.post('/api/users/2/grants', json={'grants': [{'role': 'EMPLOYEE', 'department_id': None}]}).status_code == 403
+    assert admin.post('/api/users/1/grants', json={'grants': [{'role': 'DEPARTMENT_MANAGER', 'department_id': 1}]}).status_code == 200
+    assert employee.get('/api/me').status_code == 401
+    employee = client('EMPLOYEE1')
+    assert employee.post('/api/session/role', json={'role': 'DEPARTMENT_MANAGER', 'department_id': 1}).status_code == 200
+    assert employee.post('/api/tickets', json={'title': 'Другой', 'description': 'Длинное описание', 'category': 'IT'}).status_code == 403
+    assert employee.get(f'/api/tickets/{ticket}').json()['access'] == 'author'
+    assert act(employee, ticket, 'accept').status_code == 403
+    assert act(manager, ticket, 'accept').status_code == 200
+    assert employee.post('/api/session/role', json={'role': 'EMPLOYEE', 'department_id': None}).status_code == 200
+    assert employee.get(f'/api/tickets/{ticket}').status_code == 200
+
+
 def test_deadline_notifications_are_idempotent_and_do_not_link_anonymous_author():
     from datetime import datetime, timedelta
     from backend.deadlines import generate_reminders
     from backend.models import DeadlineReminder
-    attempts.clear(); employee=client('EMPLOYEE1'); admin=client('SUPER_ADMIN2'); manager=client('DEPARTMENT_MANAGER3')
-    tid=employee.post('/api/tickets',json={'title':'Анонимный сканер','description':'Сканер не работает','category':'Оборудование','anonymous':True}).json()['ticket']['id']
-    assert admin.post(f'/api/tickets/{tid}/route',json={'department_id':1}).status_code==200
-    assert manager.post(f'/api/tickets/{tid}/assign',json={'executor_id':4,'due_at':'2030-01-01T14:00:00+05:00'}).status_code==200
+    attempts.clear()
+    employee, manager = map(client, ('EMPLOYEE1', 'DEPARTMENT_MANAGER3'))
+    tid = employee.post('/api/tickets', json={
+        'title': 'Анонимный сканер', 'description': 'Сканер не работает', 'category': 'Оборудование', 'anonymous': True,
+    }).json()['ticket']['id']
+    assert act(manager, tid, 'accept').status_code == 200
+    assert act(manager, tid, 'assign', executor_id=4, due_at=DUE).status_code == 200
     with Session() as db:
-        assert db.get(Ticket,tid).due_at==datetime(2030,1,1,9,0)
-        start=datetime(2030,1,1,8,0); count=generate_reminders(db,start); assert count>=3
-        assert generate_reminders(db,start)==0
-        assert not db.scalar(select(DeadlineReminder).where(DeadlineReminder.ticket_id==tid,DeadlineReminder.user_id==1)) is None  # manager role, not author identity
-        assert db.get(Ticket,tid).author_id is None
-        assert generate_reminders(db,start+timedelta(hours=2))>=3
+        assert db.get(Ticket, tid).due_at == datetime(2030, 1, 1, 9, 0)
+        start = datetime(2030, 1, 1, 8, 0)
+        assert generate_reminders(db, start) >= 2
+        assert generate_reminders(db, start) == 0
+        assert not db.scalar(select(DeadlineReminder).where(DeadlineReminder.ticket_id == tid, DeadlineReminder.user_id == 1))
+        assert db.get(Ticket, tid).author_id is None
+        assert generate_reminders(db, start + timedelta(hours=2)) >= 2
+
+
 def test_anonymous_image_strips_metadata_and_requires_token(tmp_path,monkeypatch):
     import base64,io
     from PIL import Image,PngImagePlugin
@@ -127,18 +200,32 @@ def test_anonymous_image_strips_metadata_and_requires_token(tmp_path,monkeypatch
     with Session() as db:
         assert db.get(Ticket,tid).author_id is None
         assert db.get(Attachment,aid).name=='Анонимное изображение.png'
-    assert admin.get(f'/api/tickets/{tid}/attachments/{aid}').status_code==200
-def test_edit_and_return_for_routing():
-    attempts.clear(); employee=client('EMPLOYEE1'); admin=client('SUPER_ADMIN2'); manager=client('DEPARTMENT_MANAGER3')
-    created=employee.post('/api/tickets',json={'title':'Проблема склада','description':'Описание проблемы склада','category':'Оборудование','anonymous':True}).json(); tid=created['ticket']['id']; token=created['anonymous_token']
-    data={'token':token,'title':'Обновлённый сканер','description':'Сканер перестал читать штрихкоды','solution':'Заменить'}
-    assert employee.post('/api/anonymous/edit',json=data).json()['title']==data['title']
-    assert admin.post(f'/api/tickets/{tid}/route',json={'department_id':1}).status_code==200
-    assert employee.post('/api/anonymous/edit',json=data).status_code==400
-    assert manager.post(f'/api/tickets/{tid}/status',json={'status':'NEEDS_INFO','result':'Уточните модель'}).status_code==200
-    assert employee.post('/api/anonymous/comment',json={'token':token,'body':'Модель указана'}).json()['status']=='ASSIGNED'
-    assert manager.post(f'/api/tickets/{tid}/status',json={'status':'PENDING_ROUTING','result':'Нужен другой отдел'}).status_code==200
-    assert manager.get(f'/api/tickets/{tid}').status_code==404
+    assert admin.get(f'/api/tickets/{tid}/attachments/{aid}').status_code==403
+    assert client('DEPARTMENT_MANAGER3').get(f'/api/tickets/{tid}/attachments/{aid}').status_code==200
+def test_edit_redirect_and_return_for_review():
+    attempts.clear()
+    employee, source, target = map(client, ('EMPLOYEE1', 'DEPARTMENT_MANAGER3', 'DEPARTMENT_MANAGER10'))
+    result = employee.post('/api/tickets', json={
+        'title': 'Проблема склада', 'description': 'Описание проблемы склада', 'category': 'Оборудование', 'anonymous': True,
+    }).json()
+    tid, token = result['ticket']['id'], result['anonymous_token']
+    data = {'token': token, 'title': 'Обновлённый сканер', 'description': 'Сканер перестал читать штрихкоды', 'solution': 'Заменить'}
+    assert employee.post('/api/anonymous/edit', json=data).json()['title'] == data['title']
+    assert act(source, tid, 'redirect', department_id=999, reason='Другой отдел').status_code == 400
+    assert source.get(f'/api/tickets/{tid}').json()['owner_id'] == 3
+    assert act(source, tid, 'redirect', department_id=2, reason='Неисправность ПО').json()['department_id'] == 2
+    assert source.get(f'/api/tickets/{tid}').status_code == 404
+    moved = target.get(f'/api/tickets/{tid}').json()
+    assert moved['status'] == 'NEW' and moved['owner_id'] == 10
+    assert any(h['reason'] == 'Неисправность ПО' for h in moved['history'])
+    assert act(target, tid, 'accept').status_code == 200
+    assert employee.post('/api/anonymous/edit', json=data).status_code == 400
+    assert act(target, tid, 'assign', executor_id=5, due_at=DUE).status_code == 200
+    assert act(target, tid, 'return', reason='').status_code == 400
+    assert act(target, tid, 'return', reason='Нужна диагностика').json()['status'] == 'ASSIGNED'
+    assert client('EXECUTOR5').get(f'/api/tickets/{tid}').status_code == 404
+
+
 def test_shared_rate_limit_without_storing_ip_or_token(monkeypatch):
     from backend.models import RateLimitBucket
     monkeypatch.setenv('RATE_LIMIT_ENABLED','1')
@@ -150,14 +237,113 @@ def test_shared_rate_limit_without_storing_ip_or_token(monkeypatch):
     with Session() as db:
         records=list(db.scalars(select(RateLimitBucket))); assert len(records)==1
         assert 'testclient' not in records[0].key and 'a'*40 not in records[0].key
+
+
+def test_deputy_fallback_and_feedback():
+    attempts.clear()
+    admin, author, deputy = map(client, ('ADMIN_ASSISTANT7', 'EMPLOYEE1', 'EMPLOYEE11'))
+    settings = {'head_id': 3, 'deputy_id': 11}
+    assert admin.post('/api/workflow/offices/1', json=settings).status_code == 200
+    assert author.post('/api/workflow/offices/1', json=settings).status_code == 403
+    with Session.begin() as db:
+        db.get(User, 3).active = False
+    try:
+        assert deputy.post('/api/session/role', json={
+            'role': 'DEPARTMENT_DEPUTY', 'department_id': 1,
+        }).status_code == 200
+        body = {'title': 'Хороший отзыв', 'description': 'Отдел отлично справился',
+                'category': 'Оборудование', 'kind': 'FEEDBACK'}
+        ticket = author.post('/api/tickets', json=body).json()['ticket']
+        assert deputy.get(f"/api/tickets/{ticket['id']}").json()['owner_id'] == 11
+        assert act(deputy, ticket['id'], 'accept').status_code == 200
+        assert act(deputy, ticket['id'], 'feedback', reason='Благодарность передана').json()['status'] == 'CLOSED'
+        with Session.begin() as db:
+            db.get(User, 11).active = False
+        assert author.post('/api/tickets', json=body).status_code == 409
+        assert admin.post('/api/workflow/routes', json={'category_id': 1, 'department_id': 1}).status_code == 400
+    finally:
+        with Session.begin() as db:
+            db.get(User, 3).active = db.get(User, 11).active = True
+        assert admin.post('/api/workflow/offices/1', json=settings | {'deputy_id': None}).status_code == 200
+
+
+def test_employee_assignment_and_cross_department_projection(tmp_path, monkeypatch):
+    import base64
+    attempts.clear()
+    monkeypatch.setenv('UPLOAD_DIR', str(tmp_path))
+    author, manager, author_manager, worker, previous = map(
+        client, ('EMPLOYEE8', 'DEPARTMENT_MANAGER3', 'DEPARTMENT_MANAGER10', 'EMPLOYEE9', 'EXECUTOR4'))
+    tid = author.post('/api/tickets', json={
+        'title': 'Устройство в ремонте', 'description': 'Складскому сканеру нужен ремонт', 'category': 'IT',
+    }).json()['ticket']['id']
+    assert worker.get(f'/api/tickets/{tid}').status_code == 404
+    assert act(author, tid, 'assign', executor_id=9, due_at=DUE).status_code == 403
+    assert act(manager, tid, 'accept', record_version=1).status_code == 200
+    assert act(manager, tid, 'assign', executor_id=4, due_at=DUE, record_version=1).status_code == 409
+    assert act(manager, tid, 'assign', executor_id=4, due_at=DUE).status_code == 200
+    assert act(manager, tid, 'assign', executor_id=9, due_at='2031-01-01T12:00:00Z').status_code == 200
+    assert previous.get(f'/api/tickets/{tid}').status_code == 404
+    assert [row['id'] for row in worker.get('/api/tickets', params={'queue': 'assigned'}).json()] == [tid]
+    assert worker.get(f'/api/tickets/{tid}').json()['access'] == 'internal'
+    assert manager.post(f'/api/tickets/{tid}/comments', json={'body': 'Служебная запись'}).status_code == 200
+    attachment = manager.post(f'/api/tickets/{tid}/attachments', json={
+        'name': 'service.txt', 'content_base64': base64.b64encode(b'Internal note').decode(),
+    }).json()
+    limited = author_manager.get(f'/api/tickets/{tid}').json()
+    own = author.get(f'/api/tickets/{tid}').json()
+    assert limited['access'] == own['access'] == 'author'
+    assert limited['description'] == own['description']
+    assert limited['comments'] == own['comments'] == []
+    assert limited['attachments'] == own['attachments'] == []
+    assert 'integration' not in limited and 'executor_id' not in limited
+    assert author_manager.get(f"/api/tickets/{tid}/attachments/{attachment['id']}").status_code == 404
+    assert author_manager.get(f'/api/tickets/{tid}/products').status_code == 403
+    assert author_manager.post(f'/api/tickets/{tid}/comments', json={'body': 'Недоступно'}).status_code == 403
+    assert any(row['id'] == tid for row in author_manager.get('/api/tickets?queue=outgoing').json())
+
+
+def test_refusal_and_joint_review_preserve_every_decision():
+    attempts.clear()
+    author, manager, admin, other_admin = map(
+        client, ('EMPLOYEE1', 'DEPARTMENT_MANAGER3', 'ADMIN6', 'ADMIN_ASSISTANT7'))
+    tid = author.post('/api/tickets', json={
+        'title': 'Предложение по складу', 'description': 'Описание предложения для проверки пересмотра',
+        'category': 'Оборудование',
+    }).json()['ticket']['id']
+    assert act(manager, tid, 'accept').status_code == 200
+    assert act(manager, tid, 'refuse').status_code == 400
+    refusal = act(manager, tid, 'refuse', reason='Нужны дополнительные основания').json()
+    assert refusal['status'] == 'REJECTED' and len(refusal['refusals']) == 1
+    refusal_id = refusal['refusals'][0]['id']
+    request = {'description': 'Не согласен с оценкой', 'reason': 'Есть новые сведения'}
+    assert act(author, tid, 'appeal', **request).json()['status'] == 'APPEAL'
+    assert 'description' not in admin.get(f'/api/tickets/{tid}').json()
+    assert act(admin, tid, 'claim').json()['access'] == 'appeal'
+    assert 'description' not in other_admin.get(f'/api/tickets/{tid}').json()
+    assert act(other_admin, tid, 'vote', reason='Не участвую', decision='REOPEN').status_code == 403
+    assert act(manager, tid, 'vote', reason='Требуется повторная оценка', decision='REOPEN').json()['status'] == 'APPEAL'
+    assert act(admin, tid, 'vote', reason='Согласен с отказом', decision='UPHOLD').json()['status'] == 'APPEAL'
+    assert act(manager, tid, 'vote', reason='Доводов недостаточно', decision='UPHOLD').json()['status'] == 'REJECTED'
+    assert 'description' not in admin.get(f'/api/tickets/{tid}').json()
+    assert act(author, tid, 'appeal', **request).json()['status'] == 'REJECTED'
+    assert act(admin, tid, 'admit', reason='Доводы уже рассмотрены', decision='DENY').json()['status'] == 'REJECTED'
+    assert act(author, tid, 'appeal', **(request | {'reason': 'Появился новый документ'})).status_code == 200
+    assert act(admin, tid, 'admit', reason='Появилось новое основание', decision='ALLOW').json()['status'] == 'APPEAL'
+    assert act(admin, tid, 'vote', reason='Нужно проверить документ', decision='REOPEN').json()['status'] == 'APPEAL'
+    assert act(manager, tid, 'vote', reason='Отдел проверит документ', decision='REOPEN').json()['status'] == 'ASSIGNED'
+    saved = author.get(f'/api/tickets/{tid}').json()['refusals']
+    assert saved[0]['id'] == refusal_id
+    assert [a['joint_outcome'] for a in saved[0]['appeals']] == ['UPHOLD', None, 'REOPEN']
+    assert saved[0]['appeals'][1]['admission_decision'] == 'DENY'
 def test_implemented_suggestion_and_assignment_history():
     from backend.models import TicketAssignment
     attempts.clear(); employee=client('EMPLOYEE1'); admin=client('SUPER_ADMIN2'); manager=client('DEPARTMENT_MANAGER3'); executor=client('EXECUTOR4')
     tid=employee.post('/api/tickets',json={'title':'Заменить сканер','description':'Устройство больше не работает','category':'Оборудование','solution':'Заменить устройство'}).json()['ticket']['id']
     assert admin.post(f'/api/tickets/{tid}/implementation',json={'implemented':True}).status_code==400
-    assert admin.post(f'/api/tickets/{tid}/route',json={'department_id':1}).status_code==200
-    assert manager.post(f'/api/tickets/{tid}/assign',json={'executor_id':4}).status_code==200
-    assert executor.post(f'/api/tickets/{tid}/status',json={'status':'RESOLVED','result':'Устройство заменено'}).status_code==200
+    assert act(manager, tid, 'accept').status_code == 200
+    assert act(manager, tid, 'assign', executor_id=4, due_at=DUE).status_code == 200
+    assert act(executor, tid, 'submit_result', description='Работа выполнена', reason='Устройство заменено').status_code == 200
+    assert act(manager, tid, 'confirm').status_code == 200
     assert employee.post(f'/api/tickets/{tid}/implementation',json={'implemented':True}).status_code==403
     assert admin.post(f'/api/tickets/{tid}/implementation',json={'implemented':True}).status_code==200
     assert admin.get('/api/analytics').json()['implemented_suggestions']>=1
@@ -169,8 +355,8 @@ def test_full_integration_records_idempotent_order_and_refresh(tmp_path,monkeypa
     from backend.models import IntegrationEvent,ExternalEntity
     attempts.clear(); admin=client('SUPER_ADMIN2'); employee=client('EMPLOYEE1'); manager=client('DEPARTMENT_MANAGER3'); executor=client('EXECUTOR4')
     tid=employee.post('/api/tickets',json={'title':'Заявка на сканер','description':'Не работает складской сканер','category':'Оборудование'}).json()['ticket']['id']
-    assert admin.post(f'/api/tickets/{tid}/route',json={'department_id':1}).status_code==200
-    assert manager.post(f'/api/tickets/{tid}/assign',json={'executor_id':4}).status_code==200
+    assert act(manager, tid, 'accept').status_code == 200
+    assert act(manager, tid, 'assign', executor_id=4, due_at=DUE).status_code == 200
     with socket.socket() as sock: sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]
     env=os.environ.copy();env['MOCK_DB']=str(tmp_path/'mock.db');url=f'http://127.0.0.1:{port}';monkeypatch.setenv('MOCK_1C_URL',url)
     process=subprocess.Popen([sys.executable,'-m','uvicorn','mock_1c.main:app','--host','127.0.0.1','--port',str(port)],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
@@ -204,13 +390,13 @@ def test_sqlite_backup_does_not_overwrite(tmp_path):
 def test_invalid_external_order_is_recorded_as_failure(monkeypatch):
     import backend.operations_api as api
     from backend.models import IntegrationEvent
-    attempts.clear(); admin=client('SUPER_ADMIN2')
+    attempts.clear(); manager=client('DEPARTMENT_MANAGER3')
     with Session.begin() as db:
-        t=Ticket(title='Проверка контракта',description='Тестовые данные',category='IT',solution='',recommendation='IT',reason='test',status='NEW');db.add(t);db.flush();tid=t.id
+        t=Ticket(department_id=1,title='Проверка контракта',description='Тестовые данные',category='IT',solution='',recommendation='IT',reason='test',status='NEW');db.add(t);db.flush();tid=t.id
     class BadClient:
         def create_order(self,data,key): return {'id':1}
     monkeypatch.setattr(api,'integration_client',lambda mode=None:BadClient())
-    assert admin.post(f'/api/tickets/{tid}/orders',json={'item':'Сканер','key':'test-key-12345'}).status_code==502
+    assert manager.post(f'/api/tickets/{tid}/orders',json={'item':'Сканер','key':'test-key-12345'}).status_code==502
     with Session() as db:
         event=db.scalar(select(IntegrationEvent).where(IntegrationEvent.ticket_id==tid));assert event is not None and not event.ok
 
@@ -360,6 +546,31 @@ def test_initial_seed_and_account_persistence(tmp_path):
         assert response.status_code == 200
         uid = response.json()['id']
         assert admin.post(f'/api/users/{uid}/permissions', json={'permissions': ['data.read']}).status_code == 200
+        departments = admin.get('/api/departments').json()[:2]
+        assert admin.post('/api/users', json={
+            'login': 'routing-admin', 'password': 'review-test-password', 'role': 'ADMIN',
+        }).status_code == 200
+        route_categories = []
+        with httpx.Client(base_url=gateway, trust_env=False) as routing:
+            response = routing.post('/api/login', json={'login': 'routing-admin', 'password': 'review-test-password'})
+            assert response.status_code == 200
+            routing.headers['X-CSRF-Token'] = response.json()['csrf']
+            for department in departments:
+                did = department['id']
+                leader = admin.post('/api/users', json={
+                    'login': f'head-{did}', 'password': 'review-test-password',
+                    'role': 'EMPLOYEE', 'department_id': did,
+                })
+                assert leader.status_code == 200
+                assert routing.post(f'/api/workflow/offices/{did}', json={
+                    'head_id': leader.json()['id'], 'deputy_id': None,
+                }).status_code == 200
+                category = routing.post('/api/categories', json={'name': f'Категория {did}'})
+                assert category.status_code == 200
+                assert routing.post('/api/workflow/routes', json={
+                    'category_id': category.json()['id'], 'department_id': did,
+                }).status_code == 200
+                route_categories.append((did, f'Категория {did}'))
         with httpx.Client(base_url=gateway, trust_env=False) as staff:
             login = {'login': 'persistent-staff', 'password': 'staff-initial-password'}
             response = staff.post('/api/login', json=login)
@@ -367,20 +578,17 @@ def test_initial_seed_and_account_persistence(tmp_path):
             staff.headers['X-CSRF-Token'] = response.json()['csrf']
             assert staff.post(f'/api/users/{uid}', json={'role': 'SUPER_ADMIN'}).status_code == 403
             assert staff.get('/api/admin/data').status_code == 200
-            departments = admin.get('/api/departments').json()[:2]
             review_tickets = []
-            for department in departments:
+            for department_id, category in route_categories:
                 response = staff.post('/api/tickets', json={
-                    'title': f"Review request for department {department['id']}",
+                    'title': f'Review request for department {department_id}',
                     'description': 'Cross-department review regression test',
-                    'category': 'Оборудование',
+                    'category': category,
                 })
                 assert response.status_code == 200
-                ticket_id = response.json()['ticket']['id']
-                assert admin.post(f'/api/tickets/{ticket_id}/route', json={
-                    'department_id': department['id'],
-                }).status_code == 200
-                review_tickets.append((ticket_id, department['id']))
+                ticket = response.json()['ticket']
+                assert ticket['department_id'] == department_id
+                review_tickets.append((ticket['id'], department_id))
             assert staff.post('/api/password', json={
                 'current_password': login['password'], 'password': 'staff-new-password',
                 'confirmation': 'staff-new-password',
@@ -408,7 +616,8 @@ def test_initial_seed_and_account_persistence(tmp_path):
                 for tid, department_id in review_tickets:
                     detail = reviewer.get(f'/api/tickets/{tid}').json()
                     assert detail['department_id'] == department_id
-                    assert detail['status'] == 'ASSIGNED' and detail['history'] and detail['description']
+                    assert detail['status'] == 'NEW' and detail['access'] == 'oversight'
+                    assert 'history' not in detail and 'description' not in detail
                     assert reviewer.post(f'/api/tickets/{tid}/comments', json={'body': 'Forbidden'}).status_code == 403
                     assert reviewer.post(f'/api/tickets/{tid}/status', json={'status': 'REJECTED'}).status_code == 403
                     assert reviewer.post(f'/api/tickets/{tid}/route', json={'department_id': department_id}).status_code == 403

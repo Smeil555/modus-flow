@@ -5,23 +5,24 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from typing import Literal
 from fastapi import FastAPI, Depends, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 from argon2 import PasswordHasher
 import jwt
 from .models import Base, engine, Session, User, Department, Ticket, History, IntegrationEvent, Comment, Notification, ExternalEntity, AuditLog, Attachment, AuthSession, Category, RoutingRule, RoleGrant, TicketAssignment
-from .models import IntegrationSetting
+from .models import Appeal, Clarification, IntegrationSetting, Refusal, RoutingIssue, WorkResult
 from .data_service import (
     PERMISSIONS, account, account_transaction, audit, create_account, database_status,
     permitted, require, reset_account_password, revoke_sessions, update_account,
     update_grants, update_permissions, user_permissions,
 )
-from .roles import TICKET_REVIEW_ROLES
-from .routing import recommend
+from .roles import DEPARTMENT_LEADERS, TICKET_REVIEW_ROLES
+from . import workflow
 from .integration import integration_client, create_checked_order, get_checked_order
 
 SECRET=os.getenv('SESSION_SECRET','')
@@ -45,7 +46,7 @@ class Principal:
     permissions:frozenset[str] = frozenset()
 def available_roles(db,user):
     result=[{'role':user.role,'department_id':user.department_id}]
-    for grant in db.scalars(select(RoleGrant).where(RoleGrant.user_id==user.id)):
+    for grant in workflow.active_grants(db, user_id=user.id):
         item={'role':grant.role,'department_id':grant.department_id}
         if item not in result: result.append(item)
     return result
@@ -67,37 +68,136 @@ def current(request:Request, db=Depends(session)):
     return principal
 def roles(user,*allowed):
     if user.role not in allowed: raise HTTPException(403,'Недостаточно прав')
-def visible(t,u):
-    return u.role=='SUPER_ADMIN' or u.role in TICKET_REVIEW_ROLES or (u.role=='EMPLOYEE' and t.author_id==u.id) or (u.role=='DEPARTMENT_MANAGER' and t.department_id==u.department_id and t.department_id is not None) or (u.role=='EXECUTOR' and t.executor_id==u.id)
-def ticket_or_404(db,tid,user):
-    t=db.get(Ticket,tid)
-    if not t or not visible(t,user): raise HTTPException(404,'Обращение не найдено')
-    return t
-def serialize(t):
-    return {'id':t.id,'number':f'REQ-{t.id:06}','title':t.title,'description':t.description,'category':t.category,'solution':t.solution,'priority':t.priority,'preferred_department_id':t.preferred_department_id,'anonymous':t.token_hash is not None,'recommendation':t.recommendation,'reason':t.reason,'department_id':t.department_id,'executor_id':t.executor_id,'status':t.status,'result':t.result,'implemented':t.implemented,'due_at':t.due_at.isoformat() if t.due_at else None,'created_at':t.created_at.isoformat()}
-def history(db,t,event): db.add(History(ticket_id=t.id,event=event))
-def notify(db,t,message):
-    if t.author_id is not None: db.add(Notification(user_id=t.author_id,ticket_id=t.id,message=message))
-def detail_data(db,t):
-    return serialize(t) | {'history':[{'event':h.event,'created_at':h.created_at.isoformat()} for h in db.scalars(select(History).where(History.ticket_id==t.id).order_by(History.id))], 'comments':[{'id':c.id,'author':c.author_label,'body':c.body,'created_at':c.created_at.isoformat()} for c in db.scalars(select(Comment).where(Comment.ticket_id==t.id).order_by(Comment.id))], 'attachments':[{'id':a.id,'name':a.name,'size':a.size} for a in db.scalars(select(Attachment).where(Attachment.ticket_id==t.id))], 'integration':[{'operation':e.operation,'result':e.result,'ok':e.ok} for e in db.scalars(select(IntegrationEvent).where(IntegrationEvent.ticket_id==t.id).order_by(IntegrationEvent.id))], 'external':[{'id':e.id,'external_id':e.external_id,'number':e.number,'status':e.status,'mode':e.mode} for e in db.scalars(select(ExternalEntity).where(ExternalEntity.ticket_id==t.id))]}
+def ticket_or_404(db, tid, user):
+    ticket = db.get(Ticket, tid)
+    if not ticket or workflow.scope(db, ticket, user) is None:
+        raise HTTPException(404, 'Обращение не найдено')
+    return ticket
+
+
+def serialize(t, scope='internal'):
+    record = {
+        'id': t.id, 'number': f'REQ-{t.id:06}', 'category': t.category,
+        'category_id': t.category_id, 'department_id': t.department_id,
+        'anonymous': t.token_hash is not None, 'status': t.status,
+        'kind': t.kind, 'priority': t.priority, 'record_version': t.record_version,
+        'created_at': t.created_at.isoformat(), 'due_at': t.due_at.isoformat() if t.due_at else None,
+    }
+    if scope == 'oversight':
+        return record | {'title': f'Обращение {record["number"]}', 'owner_id': t.owner_id,
+                         'route_rule_id': t.route_rule_id}
+    record.update(title=t.title, description=t.description, solution=t.solution, result=t.result,
+                  implemented=t.implemented, recommendation=t.recommendation)
+    if scope in ('internal', 'appeal'):
+        record.update(owner_id=t.owner_id, executor_id=t.executor_id, reason=t.reason,
+                      route_rule_id=t.route_rule_id, preferred_department_id=t.preferred_department_id)
+    return record
+
+
+def history(db, ticket, message, *, public=True, actor=None):
+    workflow.event(db, ticket, 'UPDATE', message, public=public, actor=actor)
+
+
+def notify(db, ticket, message):
+    workflow.notify(db, ticket, ticket.author_id, message)
+
+
+def appeal_data(db, ticket, scope):
+    entries = db.execute(select(Refusal, Appeal).outerjoin(Appeal).where(
+        Refusal.ticket_id == ticket.id,
+    ).order_by(Refusal.id, Appeal.id)).all()
+    refusals = {}
+    for refusal, appeal in entries:
+        record = refusals.setdefault(refusal.id, {
+            'id': refusal.id, 'reason': refusal.reason, 'created_at': refusal.created_at.isoformat(),
+            'appeals': [],
+        })
+        if appeal:
+            item = {
+                'id': appeal.id, 'motivation': appeal.motivation,
+                'admission_decision': appeal.admission_decision, 'admission_reason': appeal.admission_reason,
+                'joint_outcome': appeal.joint_outcome, 'closed': appeal.closed_at is not None,
+                'manager_reason': appeal.manager_reason if appeal.joint_outcome or scope in ('internal', 'appeal') else None,
+                'admin_reason': appeal.admin_reason if appeal.joint_outcome or scope in ('internal', 'appeal') else None,
+            }
+            if scope in ('internal', 'appeal'):
+                item.update(manager_position=appeal.manager_position, admin_position=appeal.admin_position)
+            record['appeals'].append(item)
+    return list(refusals.values())
+
+
+def detail_data(db, ticket, scope, actions=()):
+    details = serialize(ticket, scope) | {'access': scope, 'actions': list(actions)}
+    if scope == 'oversight':
+        if any(action in actions for action in ('admit', 'claim')):
+            details['refusals'] = appeal_data(db, ticket, 'author')
+        return details
+    internal = scope in ('internal', 'appeal')
+    history_query = select(History).where(History.ticket_id == ticket.id).order_by(History.id)
+    comments = select(Comment).where(Comment.ticket_id == ticket.id).order_by(Comment.id)
+    attachments = select(Attachment).where(Attachment.ticket_id == ticket.id)
+    if not internal:
+        history_query = history_query.where(or_(
+            History.author_visible.is_(True),
+            History.event_type.is_(None) & History.event.in_((
+                'Создано обращение', 'Добавлено вложение', 'Добавлено анонимное изображение',
+                'Автор изменил обращение', 'Получен ответ анонимного автора',
+            )),
+        ))
+        comments = comments.where(Comment.internal.is_(False))
+        attachments = attachments.where(Attachment.internal.is_(False))
+    details.update(
+        history=[{'event': h.event, 'created_at': h.created_at.isoformat(),
+                  'reason': h.reason if internal or h.event_type not in ('REDIRECT', 'ASSIGN', 'RETURN') else None,
+                  'event_type': h.event_type, 'origin_status': h.origin_status}
+                 for h in db.scalars(history_query)],
+        comments=[{'id': c.id, 'author': c.author_label, 'body': c.body} for c in db.scalars(comments)],
+        attachments=[{'id': a.id, 'name': a.name, 'size': a.size} for a in db.scalars(attachments)],
+        clarifications=[{'id': c.id, 'origin_status': c.origin_status, 'question': c.question, 'answer': c.answer}
+                        for c in db.scalars(select(Clarification).where(Clarification.ticket_id == ticket.id).order_by(Clarification.id))],
+        refusals=appeal_data(db, ticket, scope),
+    )
+    if internal:
+        details.update(
+            integration=[{'operation': e.operation, 'result': e.result, 'ok': e.ok} for e in db.scalars(
+                select(IntegrationEvent).where(IntegrationEvent.ticket_id == ticket.id))],
+            external=[{'id': e.id, 'number': e.number, 'status': e.status, 'mode': e.mode} for e in db.scalars(
+                select(ExternalEntity).where(ExternalEntity.ticket_id == ticket.id))],
+            work_results=[{'id': r.id, 'description': r.description, 'outcome': r.outcome,
+                           'confirmed': r.confirmed_at is not None, 'superseded': r.superseded_at is not None}
+                          for r in db.scalars(select(WorkResult).where(WorkResult.ticket_id == ticket.id).order_by(WorkResult.id))],
+        )
+    return details
+
+
+def case_details(db, ticket, user):
+    access = workflow.scope(db, ticket, user)
+    own = workflow.is_author(ticket, user)
+    return detail_data(db, ticket, access, workflow.actions(db, ticket, user)) | {
+        'can_edit': own and ticket.status == 'NEW',
+        'can_comment': own or access == 'internal',
+        'can_attach': ticket.token_hash is None and (own or access == 'internal'),
+        'can_mark_implemented': user.role == 'SUPER_ADMIN' and ticket.status in ('RESOLVED', 'CLOSED') and bool(ticket.solution.strip()),
+        'implemented': ticket.implemented,
+    }
+
+
+def author_details(db, ticket):
+    return detail_data(db, ticket, 'author', workflow.author_actions(db, ticket))
+
+
+def require_case_access(db, ticket, user, *scopes):
+    if workflow.scope(db, ticket, user) not in scopes:
+        raise HTTPException(403, 'Недостаточно прав для действия с обращением')
 def anonymous_ticket(db,token):
     t=db.scalar(select(Ticket).where(Ticket.token_hash==hashlib.sha256(token.encode()).hexdigest()))
     if not t: raise HTTPException(404,'Обращение не найдено')
     return t
-def routing_recommendation(db,title,description,category):
-    text=(title+' '+description+' '+category).lower(); match=None
-    for rule in db.scalars(select(RoutingRule).where(RoutingRule.active==True).order_by(RoutingRule.id)):
-        dept=db.get(Department,rule.department_id)
-        if rule.keyword.lower() in text and dept and dept.active: match=(dept.name,f'Совпадение по правилу «{rule.keyword}»'); break
-    configured=db.scalar(select(RoutingRule.id).limit(1)) is not None
-    department,reason=match or (('Руководство','Нет совпадения с активными правилами; требуется ручная проверка') if configured else recommend(title,description,category))
-    if not db.scalar(select(Department).where(Department.name==department,Department.active==True)): return 'Не определён','Подходящий активный отдел не найден; требуется ручная проверка'
-    return department,reason
-def resume_after_info(t): return 'PENDING_ROUTING' if t.department_id is None else ('IN_PROGRESS' if t.executor_id else 'ASSIGNED')
 class Login(BaseModel): login:str; password:str
 class NewTicket(BaseModel):
     title:str=Field(min_length=3,max_length=200); description:str=Field(min_length=5,max_length=5000); category:str=Field(min_length=1,max_length=100); solution:str=Field(default='',max_length=2000); anonymous:bool=False; priority:str='NORMAL'; preferred_department_id:int | None=None
-class Route(BaseModel): department_id:int
+    kind: Literal['REQUEST', 'FEEDBACK'] = 'REQUEST'
+class Route(BaseModel): department_id:int; reason:str=Field(default="", max_length=5000)
 class Assign(BaseModel): executor_id:int; due_at:datetime | None=None
 class Change(BaseModel): status:str; result:str=Field(default='',max_length=3000)
 class Order(BaseModel): item:str=Field(min_length=1,max_length=200); key:str=Field(min_length=8,max_length=100)
@@ -105,6 +205,7 @@ class Token(BaseModel): token:str=Field(min_length=20,max_length=200)
 class CommentBody(BaseModel): body:str=Field(min_length=1,max_length=3000)
 class AnonymousComment(CommentBody,Token): pass
 class AnonymousStatus(Token): status:str
+class AnonymousAction(Token, workflow.Action): pass
 class TicketEdit(BaseModel): title:str=Field(min_length=3,max_length=200); description:str=Field(min_length=5,max_length=5000); solution:str=Field(default='',max_length=2000)
 class AnonymousEdit(TicketEdit,Token): pass
 class AnonymousImage(Token): content_base64:str=Field(max_length=7_000_000)
@@ -216,30 +317,39 @@ def logout(request:Request,response:Response,u=Depends(current),db=Depends(sessi
 def departments(u=Depends(current),db=Depends(session)):
     return [{'id':d.id,'name':d.name,'description':d.description,'active':d.active} for d in db.scalars(select(Department)) if d.active or permitted(u,'departments.manage') or u.role in TICKET_REVIEW_ROLES]
 @app.get('/api/users')
-def users(u=Depends(current),db=Depends(session)):
-    roles(u,'SUPER_ADMIN','DEPARTMENT_MANAGER')
-    result=[]
-    for x in db.scalars(select(User)):
-        memberships=available_roles(db,x)
-        if u.role!='SUPER_ADMIN': memberships=[m for m in memberships if m['department_id']==u.department_id]
-        if u.role=='SUPER_ADMIN' or memberships: result.append({'id':x.id,'login':x.login,'role':x.role if u.role=='SUPER_ADMIN' else memberships[0]['role'],'department_id':x.department_id if u.role=='SUPER_ADMIN' else u.department_id,'active':x.active,'roles':memberships})
+def users(u=Depends(current), db=Depends(session)):
+    roles(u, 'SUPER_ADMIN', *DEPARTMENT_LEADERS)
+    if u.role != 'SUPER_ADMIN' and not workflow.leads_department(db, u, u.department_id):
+        raise HTTPException(403, 'Доступен только справочник своего отдела')
+    result = []
+    for person in db.scalars(select(User).order_by(User.login)):
+        memberships = available_roles(db, person)
+        if u.role != 'SUPER_ADMIN':
+            memberships = [m for m in memberships if m['department_id'] == u.department_id]
+        if u.role == 'SUPER_ADMIN' or memberships:
+            result.append({'id': person.id, 'login': person.login,
+                           'role': person.role if u.role == 'SUPER_ADMIN' else memberships[0]['role'],
+                           'department_id': person.department_id if u.role == 'SUPER_ADMIN' else u.department_id,
+                           'active': person.active, 'roles': memberships,
+                           'eligible_worker': workflow.eligible_worker(db, person, u.department_id)})
     return result
+
+
 @app.post('/api/tickets')
-def create(data:NewTicket,u=Depends(current),db=Depends(session)):
-    roles(u,'EMPLOYEE'); raw=secrets.token_urlsafe(32) if data.anonymous else None
-    if data.priority not in ('LOW','NORMAL','HIGH','URGENT'): raise HTTPException(400,'Недопустимый приоритет')
-    if data.preferred_department_id is not None:
-        preferred=db.get(Department,data.preferred_department_id)
-        if not preferred or not preferred.active: raise HTTPException(400,'Отдел недоступен')
-    department,reason=routing_recommendation(db,data.title,data.description,data.category)
-    t=Ticket(title=data.title,description=data.description,category=data.category,solution=data.solution,priority=data.priority,preferred_department_id=data.preferred_department_id,author_id=None if raw else u.id,token_hash=hashlib.sha256(raw.encode()).hexdigest() if raw else None,recommendation=department,reason=reason,status='NEW')
-    db.add(t); db.flush(); history(db,t,'Создано обращение'); notify(db,t,'Обращение создано')
-    for admin in db.scalars(select(User).where(User.active==True)):
-        if any(g['role']=='SUPER_ADMIN' for g in available_roles(db,admin)): db.add(Notification(user_id=admin.id,ticket_id=t.id,message='Новое обращение ожидает распределения'))
-    db.commit()
-    return {'ticket':serialize(t),'anonymous_token':raw}
+def create(data: NewTicket, u=Depends(current), db=Depends(session)):
+    roles(u, 'EMPLOYEE')
+    if data.priority not in ('LOW', 'NORMAL', 'HIGH', 'URGENT'):
+        raise HTTPException(400, 'Недопустимый приоритет')
+    if len(data.title.strip()) < 3 or len(data.description.strip()) < 5:
+        raise HTTPException(400, 'Заполните заголовок и описание')
+    raw = secrets.token_urlsafe(32) if data.anonymous else None
+    ticket = workflow.create_request(db, u, data, hashlib.sha256(raw.encode()).hexdigest() if raw else None)
+    return {'ticket': serialize(ticket, 'author'), 'anonymous_token': raw}
 @app.get('/api/tickets')
-def tickets(status:str|None=None,category:str|None=None,department_id:int|None=None,priority:str|None=None,from_date:datetime|None=None,to_date:datetime|None=None,integration:bool|None=None,u=Depends(current),db=Depends(session)):
+def tickets(status: str | None = None, category: str | None = None, department_id: int | None = None,
+            priority: str | None = None, from_date: datetime | None = None, to_date: datetime | None = None,
+            integration: bool | None = None, queue: Literal['incoming', 'outgoing', 'assigned', 'own'] | None = None,
+            u=Depends(current), db=Depends(session)):
     query=select(Ticket).order_by(Ticket.id.desc())
     if status: query=query.where(Ticket.status==status)
     if category: query=query.where(Ticket.category==category)
@@ -250,29 +360,73 @@ def tickets(status:str|None=None,category:str|None=None,department_id:int|None=N
     if integration is not None:
         has_event=select(IntegrationEvent.id).where(IntegrationEvent.ticket_id==Ticket.id).exists()
         query=query.where(has_event if integration else ~has_event)
-    return [serialize(t) for t in db.scalars(query) if visible(t,u)]
+    rows = []
+    for ticket in db.scalars(query):
+        access = workflow.scope(db, ticket, u)
+        if access is None or (integration is not None and access not in ('internal', 'appeal')):
+            continue
+        if queue == 'incoming' and not workflow.leads_department(db, u, ticket.department_id):
+            continue
+        if queue == 'outgoing' and not (
+            access == 'author' and ticket.department_id != u.department_id
+            and workflow.leads_department(db, u, ticket.author_department_id)
+        ):
+            continue
+        if queue == 'assigned' and not workflow.assigned(ticket, u):
+            continue
+        if queue == 'own' and not workflow.is_author(ticket, u):
+            continue
+        rows.append(serialize(ticket, access))
+    return rows
 @app.post('/api/anonymous')
-def anonymous(data:Token, u=Depends(current),db=Depends(session)):
-    roles(u,'EMPLOYEE'); return detail_data(db,anonymous_ticket(db,data.token))
+def anonymous(data: Token, u=Depends(current), db=Depends(session)):
+    roles(u, 'EMPLOYEE')
+    return author_details(db, anonymous_ticket(db, data.token))
+
+
+@app.post('/api/anonymous/actions')
+def anonymous_action(data: AnonymousAction, u=Depends(current), db=Depends(session)):
+    roles(u, 'EMPLOYEE')
+    workflow.begin_write(db)
+    ticket = anonymous_ticket(db, data.token)
+    workflow.apply_action(db, ticket, u, data, via_token=True)
+    return author_details(db, ticket)
+
+
 @app.post('/api/anonymous/comment')
-def anonymous_comment(data:AnonymousComment,u=Depends(current),db=Depends(session)):
-    roles(u,'EMPLOYEE'); t=anonymous_ticket(db,data.token)
-    db.add(Comment(ticket_id=t.id,author_id=None,author_label='Анонимный автор',body=data.body)); history(db,t,'Получен ответ анонимного автора')
-    if t.status=='NEEDS_INFO': t.status=resume_after_info(t); history(db,t,f'Статус: {t.status}')
-    db.commit(); return detail_data(db,t)
-def update_ticket_content(db,t,data):
-    if t.status not in ('NEW','PENDING_ROUTING'): raise HTTPException(400,'Изменение доступно до распределения')
-    t.title=data.title; t.description=data.description; t.solution=data.solution
-    t.recommendation,t.reason=routing_recommendation(db,t.title,t.description,t.category)
-    history(db,t,'Автор изменил обращение'); db.commit(); return detail_data(db,t)
+def anonymous_comment(data: AnonymousComment, u=Depends(current), db=Depends(session)):
+    roles(u, 'EMPLOYEE')
+    workflow.begin_write(db)
+    ticket = anonymous_ticket(db, data.token)
+    db.add(Comment(ticket_id=ticket.id, author_id=None, author_label='Анонимный автор', body=data.body))
+    history(db, ticket, 'Добавлен комментарий анонимного автора')
+    workflow.notify(db, ticket, ticket.owner_id, 'Добавлен комментарий автора')
+    db.commit()
+    return author_details(db, ticket)
+
+
+def update_ticket_content(db, ticket, data):
+    if ticket.status != 'NEW':
+        raise HTTPException(400, 'Изменение доступно до начала рассмотрения')
+    ticket.title, ticket.description, ticket.solution = data.title, data.description, data.solution
+    ticket.record_version += 1
+    history(db, ticket, 'Автор изменил обращение')
+    db.commit()
+    return author_details(db, ticket)
+
+
 @app.post('/api/anonymous/edit')
-def anonymous_edit(data:AnonymousEdit,u=Depends(current),db=Depends(session)):
-    roles(u,'EMPLOYEE'); return update_ticket_content(db,anonymous_ticket(db,data.token),data)
+def anonymous_edit(data: AnonymousEdit, u=Depends(current), db=Depends(session)):
+    roles(u, 'EMPLOYEE')
+    workflow.begin_write(db)
+    return update_ticket_content(db, anonymous_ticket(db, data.token), data)
+
+
 @app.post('/api/anonymous/status')
-def anonymous_status(data:AnonymousStatus,u=Depends(current),db=Depends(session)):
-    roles(u,'EMPLOYEE'); t=anonymous_ticket(db,data.token)
-    if t.status!='RESOLVED' or data.status not in ('REOPENED','CLOSED'): raise HTTPException(400,'Недопустимый переход статуса')
-    t.status=data.status; history(db,t,f'Статус: {t.status}'); db.commit(); return detail_data(db,t)
+def anonymous_status(data: AnonymousStatus, u=Depends(current), db=Depends(session)):
+    roles(u, 'EMPLOYEE')
+    anonymous_ticket(db, data.token)
+    raise HTTPException(403, 'Завершение обращения доступно руководителю')
 @app.post('/api/anonymous/attachments')
 def anonymous_image(data:AnonymousImage,u=Depends(current),db=Depends(session)):
     roles(u,'EMPLOYEE'); t=anonymous_ticket(db,data.token)
@@ -299,23 +453,31 @@ def anonymous_image(data:AnonymousImage,u=Depends(current),db=Depends(session)):
 @app.post('/api/anonymous/attachments/download')
 def anonymous_download(data:AnonymousDownload,u=Depends(current),db=Depends(session)):
     roles(u,'EMPLOYEE'); t=anonymous_ticket(db,data.token); a=db.get(Attachment,data.attachment_id)
-    if not a or a.ticket_id!=t.id: raise HTTPException(404,'Вложение не найдено')
+    if not a or a.ticket_id!=t.id or a.internal: raise HTTPException(404,'Вложение не найдено')
     path=Path(os.getenv('UPLOAD_DIR','uploads'))/a.storage_key
     if not path.is_file(): raise HTTPException(404,'Файл не найдено')
     return FileResponse(path,media_type='application/octet-stream',filename=a.name,headers={'X-Content-Type-Options':'nosniff'})
 @app.get('/api/tickets/{tid}')
-def detail(tid:int,u=Depends(current),db=Depends(session)):
-    t=ticket_or_404(db,tid,u)
-    return detail_data(db,t) | {'attachments':[{'id':a.id,'name':a.name,'size':a.size} for a in db.scalars(select(Attachment).where(Attachment.ticket_id==t.id))]}
+def detail(tid: int, u=Depends(current), db=Depends(session)):
+    return case_details(db, ticket_or_404(db, tid, u), u)
+
+
 @app.post('/api/tickets/{tid}/edit')
-def edit_ticket(tid:int,data:TicketEdit,u=Depends(current),db=Depends(session)):
-    roles(u,'EMPLOYEE'); t=ticket_or_404(db,tid,u)
-    return update_ticket_content(db,t,data)
+def edit_ticket(tid: int, data: TicketEdit, u=Depends(current), db=Depends(session)):
+    workflow.begin_write(db)
+    ticket = ticket_or_404(db, tid, u)
+    if not workflow.is_author(ticket, u):
+        raise HTTPException(403, 'Изменение доступно только автору')
+    return update_ticket_content(db, ticket, data)
 @app.post('/api/tickets/{tid}/attachments')
 def attach(tid:int,data:FileBody,u=Depends(current),db=Depends(session)):
-    if u.role in TICKET_REVIEW_ROLES: raise HTTPException(403,'Роль предназначена для просмотра обращений')
-    t=ticket_or_404(db,tid,u)
-    if t.token_hash is not None: raise HTTPException(400,'Вложения к анонимным обращениям пока недоступны')
+    workflow.begin_write(db)
+    t = ticket_or_404(db, tid, u)
+    internal = not workflow.is_author(t, u)
+    if internal:
+        require_case_access(db, t, u, 'internal')
+    if t.token_hash is not None:
+        raise HTTPException(400, 'Автор анонимного обращения загружает изображения по секретному коду')
     suffix=Path(data.name.replace('\\','/')).suffix.lower()
     if suffix not in ('.png','.jpg','.jpeg','.pdf','.txt'): raise HTTPException(400,'Разрешены PNG, JPEG, PDF и TXT')
     try: content=base64.b64decode(data.content_base64,validate=True)
@@ -327,56 +489,66 @@ def attach(tid:int,data:FileBody,u=Depends(current),db=Depends(session)):
     path=folder/key
     try:
         with path.open('xb') as out: out.write(content)
-        a=Attachment(ticket_id=t.id,name=name,storage_key=key,size=len(content)); db.add(a); history(db,t,'Добавлено вложение'); db.commit()
+        a=Attachment(ticket_id=t.id,name=name,storage_key=key,size=len(content),internal=internal); db.add(a); history(db,t,'Добавлено вложение',public=not internal,actor=u.id); db.commit()
     except Exception:
         path.unlink(missing_ok=True); raise
     return {'id':a.id,'name':a.name,'size':a.size}
 @app.get('/api/tickets/{tid}/attachments/{aid}')
 def download(tid:int,aid:int,u=Depends(current),db=Depends(session)):
     t=ticket_or_404(db,tid,u); a=db.get(Attachment,aid)
-    if not a or a.ticket_id!=t.id: raise HTTPException(404,'Вложение не найдено')
+    require_case_access(db, t, u, 'internal', 'appeal', 'author')
+    if not a or a.ticket_id!=t.id or (a.internal and workflow.scope(db, t, u) == 'author'): raise HTTPException(404,'Вложение не найдено')
     path=Path(os.getenv('UPLOAD_DIR','uploads'))/a.storage_key
     if not path.is_file(): raise HTTPException(404,'Файл не найден')
     return FileResponse(path,media_type='application/octet-stream',filename=a.name,headers={'X-Content-Type-Options':'nosniff'})
 @app.post('/api/tickets/{tid}/comments')
-def comment(tid:int,data:CommentBody,u=Depends(current),db=Depends(session)):
-    if u.role in TICKET_REVIEW_ROLES: raise HTTPException(403,'Роль предназначена для просмотра обращений')
-    t=ticket_or_404(db,tid,u)
-    db.add(Comment(ticket_id=t.id,author_id=u.id,author_label=u.login,body=data.body)); history(db,t,'Добавлен комментарий'); notify(db,t,'Добавлен комментарий')
-    if u.role=='EMPLOYEE' and t.status=='NEEDS_INFO': t.status=resume_after_info(t); history(db,t,f'Статус: {t.status}')
-    db.commit(); return detail_data(db,t)
+def comment(tid: int, data: CommentBody, u=Depends(current), db=Depends(session)):
+    workflow.begin_write(db)
+    ticket = ticket_or_404(db, tid, u)
+    internal = not workflow.is_author(ticket, u)
+    if internal:
+        require_case_access(db, ticket, u, 'internal')
+    db.add(Comment(ticket_id=ticket.id, author_id=u.id, author_label=u.login, body=data.body, internal=internal))
+    history(db, ticket, 'Добавлен комментарий', public=not internal, actor=u.id)
+    if not internal:
+        workflow.notify(db, ticket, ticket.owner_id, 'Добавлен комментарий автора')
+    db.commit()
+    return case_details(db, ticket, u)
+
+
+@app.post('/api/tickets/{tid}/actions')
+def action(tid: int, data: workflow.Action, u=Depends(current), db=Depends(session)):
+    workflow.begin_write(db)
+    ticket = ticket_or_404(db, tid, u)
+    workflow.apply_action(db, ticket, u, data)
+    return case_details(db, ticket, u) if workflow.scope(db, ticket, u) else serialize(ticket, 'oversight')
+
+
 @app.post('/api/tickets/{tid}/route')
-def route(tid:int,data:Route,u=Depends(current),db=Depends(session)):
-    roles(u,'SUPER_ADMIN'); t=ticket_or_404(db,tid,u); d=db.get(Department,data.department_id)
-    if not d or not d.active: raise HTTPException(400,'Отдел недоступен')
-    if t.status not in ('NEW','PENDING_ROUTING','ASSIGNED','IN_PROGRESS','NEEDS_INFO','REOPENED'): raise HTTPException(400,'Недопустимый переход')
-    t.department_id=d.id; t.executor_id=None; t.due_at=None; t.status='ASSIGNED'; history(db,t,f'Назначен отдел: {d.name}'); db.add(TicketAssignment(ticket_id=t.id,department_id=d.id,actor_id=u.id,event='ROUTED')); db.add(AuditLog(actor_id=u.id,action=f'Назначен отдел для REQ-{t.id:06}')); notify(db,t,'Обращение распределено')
-    for manager in db.scalars(select(User).where(User.active==True)):
-        if assigned_role(db,manager,'DEPARTMENT_MANAGER',d.id): db.add(Notification(user_id=manager.id,ticket_id=t.id,message='Отделу назначено обращение'))
-    db.commit(); return serialize(t)
+def route(tid: int, data: Route, u=Depends(current), db=Depends(session)):
+    return action(tid, workflow.Action(action='redirect', **data.model_dump()), u, db)
+
+
 @app.post('/api/tickets/{tid}/assign')
-def assign(tid:int,data:Assign,u=Depends(current),db=Depends(session)):
-    roles(u,'DEPARTMENT_MANAGER','SUPER_ADMIN'); t=ticket_or_404(db,tid,u); worker=db.get(User,data.executor_id)
-    if t.status!='ASSIGNED' or not worker or not worker.active or not assigned_role(db,worker,'EXECUTOR',t.department_id): raise HTTPException(400,'Исполнитель или статус недоступен')
-    if data.due_at is not None and data.due_at.tzinfo is None: raise HTTPException(400,'Укажите часовой пояс срока')
-    t.executor_id=worker.id; t.due_at=data.due_at.astimezone(timezone.utc).replace(tzinfo=None) if data.due_at else None; t.status='IN_PROGRESS'; history(db,t,f'Назначен исполнитель: {worker.login}'); db.add(TicketAssignment(ticket_id=t.id,department_id=t.department_id,executor_id=worker.id,actor_id=u.id,event='ASSIGNED')); notify(db,t,'Назначен исполнитель'); db.add(Notification(user_id=worker.id,ticket_id=t.id,message='Вам назначено обращение')); db.commit(); return serialize(t)
+def assign(tid: int, data: Assign, u=Depends(current), db=Depends(session)):
+    return action(tid, workflow.Action(action='assign', **data.model_dump()), u, db)
+
+
 @app.post('/api/tickets/{tid}/status')
-def status(tid:int,data:Change,u=Depends(current),db=Depends(session)):
-    if u.role in TICKET_REVIEW_ROLES: raise HTTPException(403,'Роль предназначена для просмотра обращений')
-    t=ticket_or_404(db,tid,u)
-    allowed={'EXECUTOR':{'IN_PROGRESS':{'NEEDS_INFO','RESOLVED'},'NEEDS_INFO':{'IN_PROGRESS'}},'DEPARTMENT_MANAGER':{'ASSIGNED':{'NEEDS_INFO','PENDING_ROUTING'},'IN_PROGRESS':{'NEEDS_INFO','RESOLVED','PENDING_ROUTING'},'NEEDS_INFO':{'IN_PROGRESS','PENDING_ROUTING'}},'EMPLOYEE':{'RESOLVED':{'REOPENED','CLOSED'}},'SUPER_ADMIN':{'NEW':{'REJECTED','NEEDS_INFO','PENDING_ROUTING'},'PENDING_ROUTING':{'REJECTED','NEEDS_INFO'},'ASSIGNED':{'PENDING_ROUTING','REJECTED','NEEDS_INFO'},'IN_PROGRESS':{'PENDING_ROUTING','REJECTED','NEEDS_INFO'},'NEEDS_INFO':{'PENDING_ROUTING','REJECTED'},'RESOLVED':{'CLOSED','REOPENED'},'REOPENED':{'PENDING_ROUTING','REJECTED'}}}
-    if data.status not in allowed.get(u.role,{}).get(t.status,set()): raise HTTPException(400,'Недопустимый переход статуса')
-    if data.status in ('RESOLVED','REJECTED','NEEDS_INFO','PENDING_ROUTING') and not data.result.strip(): raise HTTPException(400,'Укажите результат, вопрос или причину')
-    if data.status=='PENDING_ROUTING':
-        db.add(TicketAssignment(ticket_id=t.id,department_id=t.department_id,executor_id=t.executor_id,actor_id=u.id,event='RETURNED')); t.department_id=None; t.executor_id=None; t.due_at=None
-    t.status=data.status
-    if data.status in ('RESOLVED','REJECTED'): t.result=data.result
-    history(db,t,f'Статус: {data.status}. {data.result}'); notify(db,t,f'Статус обращения: {data.status}'); db.commit(); return serialize(t)
+def status(tid: int, data: Change, u=Depends(current), db=Depends(session)):
+    mapping = {
+        'ASSIGNED': 'accept', 'NEEDS_INFO': 'clarify', 'REJECTED': 'refuse', 'CLOSED': 'close',
+        'PENDING_ROUTING': 'return',
+        'RESOLVED': 'submit_result' if u.role in ('EXECUTOR', 'EMPLOYEE') else 'confirm',
+    }
+    if data.status not in mapping:
+        raise HTTPException(400, 'Недопустимый переход статуса')
+    return action(tid, workflow.Action(action=mapping[data.status], reason=data.result, description=data.result), u, db)
 @app.post('/api/tickets/{tid}/implementation')
 def implementation(tid:int,data:ImplementationInput,u=Depends(current),db=Depends(session)):
     roles(u,'SUPER_ADMIN'); t=ticket_or_404(db,tid,u)
     if t.status not in ('RESOLVED','CLOSED') or not t.solution.strip(): raise HTTPException(400,'Отметить можно решённое обращение с предложением')
-    t.implemented=data.implemented; history(db,t,'Предложение отмечено реализованным' if data.implemented else 'Отметка о реализации снята'); db.add(AuditLog(actor_id=u.id,action=f'Изменена отметка предложения REQ-{tid:06}')); db.commit(); return serialize(t)
+    t.implemented=data.implemented; history(db,t,'Предложение отмечено реализованным' if data.implemented else 'Отметка о реализации снята'); db.add(AuditLog(actor_id=u.id,action=f'Изменена отметка предложения REQ-{tid:06}')); db.commit(); return serialize(t, 'oversight')
 def integration_mode(db):
     setting = db.scalar(select(IntegrationSetting).where(IntegrationSetting.name == 'integration_mode'))
     return setting.value if setting else os.getenv('INTEGRATION_MODE', 'MOCK').upper()
@@ -393,12 +565,14 @@ def integrate(db,t,operation,fn):
     return result
 @app.get('/api/tickets/{tid}/products')
 def products(tid:int,q:str='',u=Depends(current),db=Depends(session)):
-    roles(u,'SUPER_ADMIN','DEPARTMENT_MANAGER','EXECUTOR'); t=ticket_or_404(db,tid,u)
+    t=ticket_or_404(db,tid,u)
+    require_case_access(db, t, u, 'internal')
     mode=integration_mode(db)
     return integrate(db,t,'Поиск товаров '+mode,lambda:integration_client(mode).get('/products',{'q':q}))
 @app.post('/api/tickets/{tid}/orders')
 def order(tid:int,data:Order,u=Depends(current),db=Depends(session)):
-    roles(u,'SUPER_ADMIN','DEPARTMENT_MANAGER','EXECUTOR'); t=ticket_or_404(db,tid,u)
+    t=ticket_or_404(db,tid,u)
+    require_case_access(db, t, u, 'internal')
     scoped_key=hashlib.sha256(f'{t.id}:{data.key}'.encode()).hexdigest()
     mode=integration_mode(db)
     result=integrate(db,t,'Заявка '+mode,lambda:create_checked_order(integration_client(mode),{'item':data.item},scoped_key))
@@ -408,7 +582,8 @@ def order(tid:int,data:Order,u=Depends(current),db=Depends(session)):
     return result
 @app.post('/api/tickets/{tid}/orders/{eid}/refresh')
 def refresh_order(tid:int,eid:int,u=Depends(current),db=Depends(session)):
-    roles(u,'SUPER_ADMIN','DEPARTMENT_MANAGER','EXECUTOR'); t=ticket_or_404(db,tid,u); entity=db.get(ExternalEntity,eid)
+    t=ticket_or_404(db,tid,u)
+    require_case_access(db, t, u, 'internal'); entity=db.get(ExternalEntity,eid)
     if not entity or entity.ticket_id!=tid: raise HTTPException(404,'Заявка не найдена')
     if entity.mode!=integration_mode(db): raise HTTPException(400,'Режим интеграции изменился')
     result=integrate(db,t,'Проверка заявки '+entity.mode,lambda:get_checked_order(integration_client(entity.mode),entity.external_id)); entity.status=result['status']; db.commit(); return result
@@ -422,11 +597,12 @@ def analytics(u=Depends(current),db=Depends(session)):
         name=db.get(Department,t.department_id).name if t.department_id and db.get(Department,t.department_id) else 'Не распределено'; departments[name]=departments.get(name,0)+1
     response_hours=[]; resolution_hours=[]; titles={}
     for t in ts:
-        key=' '.join(t.title.lower().split()); titles[key]=titles.get(key,0)+1
+        if workflow.scope(db, t, u) in ('internal', 'appeal', 'author'):
+            key=' '.join(t.title.lower().split()); titles[key]=titles.get(key,0)+1
         comments=db.scalars(select(Comment).where(Comment.ticket_id==t.id).order_by(Comment.id)).all()
         staff=next((c for c in comments if c.author_id and (person:=db.get(User,c.author_id)) and person.role!='EMPLOYEE'),None)
         if staff: response_hours.append(max(0,(staff.created_at-t.created_at).total_seconds()/3600))
-        solved=next((h for h in db.scalars(select(History).where(History.ticket_id==t.id).order_by(History.id)) if h.event.startswith('Статус: RESOLVED')),None)
+        solved=next((h for h in db.scalars(select(History).where(History.ticket_id==t.id).order_by(History.id)) if h.event_type == 'CONFIRM' or h.event.startswith('Статус: RESOLVED')),None)
         if solved: resolution_hours.append(max(0,(solved.created_at-t.created_at).total_seconds()/3600))
     avg=lambda xs:round(sum(xs)/len(xs),2) if xs else None
     return {'total':len(ts),'new':sum(t.status=='NEW' for t in ts),'in_progress':sum(t.status=='IN_PROGRESS' for t in ts),'resolved':len(resolved),'implemented_suggestions':sum(t.implemented for t in ts),'overdue':sum(t.due_at is not None and t.due_at<now and t.status not in ('RESOLVED','CLOSED','REJECTED') for t in ts),'completion_rate':round(len(resolved)*100/len(ts),1) if ts else 0,'first_response_hours':avg(response_hours),'resolution_hours':avg(resolution_hours),'categories':categories,'departments':departments,'repeated_titles':{k:v for k,v in titles.items() if v>1},'integration_success':sum(e.ok for e in events),'integration_errors':sum(not e.ok for e in events)}
@@ -496,7 +672,7 @@ def data_status(u=Depends(current), db=Depends(session)):
 def get_grants(uid:int,u=Depends(current),db=Depends(session)):
     roles(u,'SUPER_ADMIN'); target=db.get(User,uid)
     if not target: raise HTTPException(404,'Пользователь не найден')
-    return [{'role':g.role,'department_id':g.department_id} for g in db.scalars(select(RoleGrant).where(RoleGrant.user_id==uid))]
+    return [{'role':g.role,'department_id':g.department_id} for g in db.scalars(select(RoleGrant).where(RoleGrant.user_id==uid, RoleGrant.office.is_(False)))]
 @app.post('/api/users/{uid}/grants')
 def set_grants(uid:int,data:GrantsInput,u=Depends(current),db=Depends(session)):
     roles(u, 'SUPER_ADMIN')
@@ -509,13 +685,13 @@ def similar(data:NewTicket,u=Depends(current),db=Depends(session)):
     def words(s): return set(re.findall(r'[а-яёa-z0-9]{4,}',s.lower()))
     target=words(data.title+' '+data.description); found=[]
     for t in db.scalars(select(Ticket)):
-        if not visible(t,u): continue
+        if workflow.scope(db,t,u) not in ('internal','author','appeal'): continue
         other=words(t.title+' '+t.description); score=len(target & other)/len(target | other) if target | other else 0
         if score>=.2: found.append({'id':t.id,'number':f'REQ-{t.id:06}','title':t.title,'score':round(score,2)})
     return sorted(found,key=lambda item:item['score'],reverse=True)[:5]
 @app.get('/api/integration/health')
 def integration_health(u=Depends(current),db=Depends(session)):
-    if u.role not in ('DEPARTMENT_MANAGER','EXECUTOR'): require(u,'integration.read')
+    if u.role not in (*DEPARTMENT_LEADERS, 'EXECUTOR'): require(u,'integration.read')
     mode=integration_mode(db)
     try: return {'mode':mode,'service':integration_client(mode).get('/health')}
     except Exception: raise HTTPException(502,'Сервис интеграции недоступен')
@@ -533,18 +709,19 @@ def list_categories(u=Depends(current),db=Depends(session)):
     return [{'id':c.id,'name':c.name,'active':c.active} for c in db.scalars(select(Category)) if c.active or permitted(u,'categories.manage')]
 @app.post('/api/categories')
 def add_category(data:CategoryInput,u=Depends(current),db=Depends(session)):
-    require(u,'categories.manage')
+    if u.role not in TICKET_REVIEW_ROLES: require(u,'categories.manage')
     if db.scalar(select(Category).where(Category.name==data.name)): raise HTTPException(409,'Категория уже существует')
     c=Category(**data.model_dump()); db.add(c); db.add(AuditLog(actor_id=u.id,action='Создана категория '+data.name)); db.commit(); return {'id':c.id}
 @app.post('/api/categories/{cid}')
 def edit_category(cid:int,data:CategoryInput,u=Depends(current),db=Depends(session)):
-    require(u,'categories.manage'); c=db.get(Category,cid)
+    if u.role not in TICKET_REVIEW_ROLES: require(u,'categories.manage')
+    c=db.get(Category,cid)
     if not c: raise HTTPException(404,'Категория не найдена')
     if db.scalar(select(Category).where(Category.name==data.name,Category.id!=cid)): raise HTTPException(409,'Категория уже существует')
     c.name=data.name; c.active=data.active; db.add(AuditLog(actor_id=u.id,action=f'Изменена категория {cid}')); db.commit(); return {'id':c.id}
 @app.get('/api/routing-rules')
 def list_rules(u=Depends(current),db=Depends(session)):
-    require(u,'categories.manage'); return [{'id':r.id,'keyword':r.keyword,'department_id':r.department_id,'active':r.active} for r in db.scalars(select(RoutingRule))]
+    require(u,'categories.manage'); return [{'id':r.id,'keyword':r.keyword,'department_id':r.department_id,'active':r.active} for r in db.scalars(select(RoutingRule).where(RoutingRule.category_id.is_(None)))]
 @app.post('/api/routing-rules')
 def add_rule(data:RuleInput,u=Depends(current),db=Depends(session)):
     require(u,'categories.manage'); dept=db.get(Department,data.department_id)
@@ -554,10 +731,113 @@ def add_rule(data:RuleInput,u=Depends(current),db=Depends(session)):
 @app.post('/api/routing-rules/{rid}')
 def edit_rule(rid:int,data:RuleInput,u=Depends(current),db=Depends(session)):
     require(u,'categories.manage'); r=db.get(RoutingRule,rid); dept=db.get(Department,data.department_id)
-    if not r: raise HTTPException(404,'Правило не найдено')
+    if not r or r.category_id is not None: raise HTTPException(404,'Правило не найдено')
     if not dept or (data.active and not dept.active): raise HTTPException(400,'Отдел недоступен')
     if db.scalar(select(RoutingRule).where(RoutingRule.keyword==data.keyword.lower(),RoutingRule.id!=rid)): raise HTTPException(409,'Правило уже существует')
     r.keyword=data.keyword.lower(); r.department_id=data.department_id; r.active=data.active; db.add(AuditLog(actor_id=u.id,action=f'Изменено правило {rid}')); db.commit(); return {'id':r.id}
+class OfficeInput(BaseModel):
+    head_id: int | None
+    deputy_id: int | None
+
+
+class PublishRoute(BaseModel):
+    category_id: int
+    department_id: int
+
+
+@app.get('/api/workflow/offices')
+def offices(u=Depends(current), db=Depends(session)):
+    roles(u, 'SUPER_ADMIN', *TICKET_REVIEW_ROLES)
+    people = list(db.scalars(select(User).where(User.active.is_(True), User.role != 'SUPER_ADMIN').order_by(User.login)))
+    return [{
+        'id': department.id, 'name': department.name, 'active': department.active,
+        'head_id': next((g.user_id for g in workflow.active_grants(
+            db, department_id=department.id, role='DEPARTMENT_MANAGER', office=True)), None),
+        'deputy_id': next((g.user_id for g in workflow.active_grants(
+            db, department_id=department.id, role='DEPARTMENT_DEPUTY', office=True)), None),
+        'owner_id': workflow.responsible(db, department.id),
+        'people': [{'id': user.id, 'login': user.login} for user in people
+                   if user.department_id == department.id or any(
+                       workflow.active_grants(db, user_id=user.id, department_id=department.id))],
+    } for department in db.scalars(select(Department).order_by(Department.name))]
+
+
+@app.post('/api/workflow/offices/{department_id}')
+def set_offices(department_id: int, data: OfficeInput, u=Depends(current), db=Depends(session)):
+    roles(u, *TICKET_REVIEW_ROLES)
+    workflow.configure_offices(db, u, department_id, data.head_id, data.deputy_id)
+    return {'ok': True}
+
+
+def route_data(rule):
+    return {
+        'id': rule.id, 'category_id': rule.category_id, 'department_id': rule.department_id,
+        'version': rule.version, 'active': rule.active,
+        'valid_from': rule.valid_from.isoformat() if rule.valid_from else None,
+        'valid_to': rule.valid_to.isoformat() if rule.valid_to else None,
+    }
+
+
+@app.get('/api/workflow/routes')
+def category_routes(u=Depends(current), db=Depends(session)):
+    roles(u, 'SUPER_ADMIN', *TICKET_REVIEW_ROLES)
+    return [route_data(rule) for rule in db.scalars(select(RoutingRule).where(
+        RoutingRule.category_id.is_not(None),
+    ).order_by(RoutingRule.category_id, RoutingRule.version.desc()))]
+
+
+@app.post('/api/workflow/routes')
+def publish_category_route(data: PublishRoute, u=Depends(current), db=Depends(session)):
+    roles(u, *TICKET_REVIEW_ROLES)
+    return route_data(workflow.publish_route(db, u, data.category_id, data.department_id))
+
+
+@app.post('/api/workflow/routes/{category_id}/disable')
+def disable_category_route(category_id: int, u=Depends(current), db=Depends(session)):
+    roles(u, *TICKET_REVIEW_ROLES)
+    workflow.begin_write(db)
+    rule = workflow.current_route(db, category_id)
+    if not rule:
+        raise HTTPException(404, 'Действующий маршрут не найден')
+    rule.active, rule.valid_to = False, workflow.utcnow()
+    audit(db, u, f'Маршрут категории {category_id} версии {rule.version} отключён')
+    db.commit()
+    return route_data(rule)
+
+
+@app.get('/api/workflow/issues')
+def routing_issues(u=Depends(current), db=Depends(session)):
+    roles(u, 'SUPER_ADMIN', *TICKET_REVIEW_ROLES)
+    current = []
+    for category in db.scalars(select(Category).where(Category.active.is_(True)).order_by(Category.name)):
+        route = workflow.current_route(db, category.id)
+        if route is None or workflow.responsible(db, route.department_id) is None:
+            department = db.get(Department, route.department_id) if route else None
+            reason = ('Нет опубликованного маршрута' if not route else
+                      'Принимающий отдел недоступен' if not department or not department.active else
+                      'В отделе нет действующего руководителя или заместителя')
+            current.append({'category': category.name, 'reason': reason})
+    history = [{'id': issue.id, 'category': issue.category, 'reason': issue.reason,
+                'created_at': issue.created_at.isoformat()}
+               for issue in db.scalars(select(RoutingIssue).order_by(RoutingIssue.id.desc()).limit(100))]
+    return {'current': current, 'history': history}
+
+
+@app.get('/api/workflow/appeals')
+def appeal_queue(u=Depends(current), db=Depends(session)):
+    roles(u, *TICKET_REVIEW_ROLES)
+    rows = db.execute(select(Appeal, Refusal, Ticket).join(
+        Refusal, Appeal.refusal_id == Refusal.id,
+    ).join(Ticket, Refusal.ticket_id == Ticket.id).where(
+        Appeal.closed_at.is_(None),
+    ).order_by(Appeal.id)).all()
+    return [{
+        'id': appeal.id, 'ticket_id': ticket.id, 'number': f'REQ-{ticket.id:06}',
+        'refusal_id': refusal.id, 'category': ticket.category,
+        'admission_decision': appeal.admission_decision, 'assigned': appeal.admin_user_id == u.id,
+    } for appeal, refusal, ticket in rows]
+
+
 @app.get('/api/admin/settings')
 def system_settings(u=Depends(current), db=Depends(session)):
     roles(u, 'SUPER_ADMIN')

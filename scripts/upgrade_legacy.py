@@ -16,7 +16,9 @@ if inspector.has_table('alembic_version') or not {'users','departments','tickets
     raise SystemExit('Это не неподписанная база предыдущего прототипа')
 with sqlite3.connect(path) as source, sqlite3.connect(backup) as destination: source.backup(destination)
 with engine.begin() as conn:
-    if 'active' not in {x['name'] for x in inspector.get_columns('users')}: conn.exec_driver_sql('ALTER TABLE users ADD COLUMN active BOOLEAN NOT NULL DEFAULT 1')
+    user_columns = {column['name'] for column in inspector.get_columns('users')}
+    if 'active' not in user_columns: conn.exec_driver_sql('ALTER TABLE users ADD COLUMN active BOOLEAN NOT NULL DEFAULT 1')
+    if 'must_change_password' not in user_columns: conn.exec_driver_sql('ALTER TABLE users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT 0')
     if 'description' not in {x['name'] for x in inspector.get_columns('departments')}: conn.exec_driver_sql("ALTER TABLE departments ADD COLUMN description TEXT NOT NULL DEFAULT ''")
     columns={x['name'] for x in inspector.get_columns('tickets')}
     if 'due_at' not in columns: conn.exec_driver_sql('ALTER TABLE tickets ADD COLUMN due_at DATETIME')
@@ -24,5 +26,7 @@ with engine.begin() as conn:
     if 'implemented' not in columns: conn.exec_driver_sql('ALTER TABLE tickets ADD COLUMN implemented BOOLEAN NOT NULL DEFAULT 0')
     if 'preferred_department_id' not in columns: conn.exec_driver_sql('ALTER TABLE tickets ADD COLUMN preferred_department_id INTEGER REFERENCES departments(id)')
 Base.metadata.create_all(engine)
-command.stamp(Config('alembic.ini'),'head')
+config = Config('alembic.ini')
+command.stamp(config, 'ab2026111101')
+command.upgrade(config, 'head')
 print('База обновлена. Резервная копия:',backup)
